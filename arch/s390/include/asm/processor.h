@@ -163,8 +163,7 @@ static __always_inline void __stackleak_poison(unsigned long erase_low,
 		"	la	%[addr],256(%[addr])\n"
 		"	brctg	%[tmp],0b\n"
 		"1:	stg	%[poison],0(%[addr])\n"
-		"	larl	%[tmp],3f\n"
-		"	ex	%[count],0(%[tmp])\n"
+		"	exrl	%[count],3f\n"
 		"	j	4f\n"
 		"2:	stg	%[poison],0(%[addr])\n"
 		"	j	4f\n"
@@ -417,7 +416,11 @@ static __always_inline bool regs_irqs_disabled(struct pt_regs *regs)
 
 static __always_inline void bpon(void)
 {
-	asm volatile(ALTERNATIVE("nop", ".insn	rrf,0xb2e80000,0,0,13,0", ALT_SPEC(82)));
+	asm_inline volatile(
+		ALTERNATIVE("	nop\n",
+			    "	.insn	rrf,0xb2e80000,0,0,13,0\n",
+			    ALT_SPEC(82))
+		);
 }
 
 #endif /* __ASSEMBLY__ */

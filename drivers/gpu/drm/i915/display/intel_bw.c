@@ -806,24 +806,6 @@ static int intel_bw_crtc_min_cdclk(const struct intel_crtc_state *crtc_state)
 	return DIV_ROUND_UP_ULL(mul_u32_u32(intel_bw_crtc_data_rate(crtc_state), 10), 512);
 }
 
-void intel_bw_crtc_update(struct intel_bw_state *bw_state,
-			  const struct intel_crtc_state *crtc_state)
-{
-	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
-	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
-
-	bw_state->data_rate[crtc->pipe] =
-		intel_bw_crtc_data_rate(crtc_state);
-	bw_state->num_active_planes[crtc->pipe] =
-		intel_bw_crtc_num_active_planes(crtc_state);
-	bw_state->force_check_qgv = true;
-
-	drm_dbg_kms(&i915->drm, "pipe %c data rate %u num active planes %u\n",
-		    pipe_name(crtc->pipe),
-		    bw_state->data_rate[crtc->pipe],
-		    bw_state->num_active_planes[crtc->pipe]);
-}
-
 static unsigned int intel_bw_num_active_planes(struct drm_i915_private *dev_priv,
 					       const struct intel_bw_state *bw_state)
 {
@@ -1256,7 +1238,7 @@ int intel_bw_min_cdclk(struct drm_i915_private *i915,
 	min_cdclk = intel_bw_dbuf_min_cdclk(i915, bw_state);
 
 	for_each_pipe(i915, pipe)
-		min_cdclk = max(bw_state->min_cdclk[pipe], min_cdclk);
+		min_cdclk = max(min_cdclk, bw_state->min_cdclk[pipe]);
 
 	return min_cdclk;
 }
@@ -1422,6 +1404,62 @@ int intel_bw_atomic_check(struct intel_atomic_state *state)
 	return 0;
 }
 
+static void intel_bw_crtc_update(struct intel_bw_state *bw_state,
+				 const struct intel_crtc_state *crtc_state)
+{
+	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+
+	bw_state->data_rate[crtc->pipe] =
+		intel_bw_crtc_data_rate(crtc_state);
+	bw_state->num_active_planes[crtc->pipe] =
+		intel_bw_crtc_num_active_planes(crtc_state);
+	bw_state->force_check_qgv = true;
+
+	drm_dbg_kms(&i915->drm, "pipe %c data rate %u num active planes %u\n",
+		    pipe_name(crtc->pipe),
+		    bw_state->data_rate[crtc->pipe],
+		    bw_state->num_active_planes[crtc->pipe]);
+}
+
+void intel_bw_update_hw_state(struct intel_display *display)
+{
+	struct intel_bw_state *bw_state =
+		to_intel_bw_state(display->bw.obj.state);
+	struct intel_crtc *crtc;
+
+	if (DISPLAY_VER(display) < 9)
+		return;
+
+	bw_state->active_pipes = 0;
+
+	for_each_intel_crtc(display->drm, crtc) {
+		const struct intel_crtc_state *crtc_state =
+			to_intel_crtc_state(crtc->base.state);
+		enum pipe pipe = crtc->pipe;
+
+		if (crtc_state->hw.active)
+			bw_state->active_pipes |= BIT(pipe);
+
+		if (DISPLAY_VER(display) >= 11)
+			intel_bw_crtc_update(bw_state, crtc_state);
+	}
+}
+
+void intel_bw_crtc_disable_noatomic(struct intel_crtc *crtc)
+{
+	struct intel_display *display = to_intel_display(crtc);
+	struct intel_bw_state *bw_state =
+		to_intel_bw_state(display->bw.obj.state);
+	enum pipe pipe = crtc->pipe;
+
+	if (DISPLAY_VER(display) < 9)
+		return;
+
+	bw_state->data_rate[pipe] = 0;
+	bw_state->num_active_planes[pipe] = 0;
+}
+
 static struct intel_global_state *
 intel_bw_duplicate_state(struct intel_global_obj *obj)
 {
@@ -1447,13 +1485,14 @@ static const struct intel_global_state_funcs intel_bw_funcs = {
 
 int intel_bw_init(struct drm_i915_private *i915)
 {
+	struct intel_display *display = &i915->display;
 	struct intel_bw_state *state;
 
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
 	if (!state)
 		return -ENOMEM;
 
-	intel_atomic_global_obj_init(i915, &i915->display.bw.obj,
+	intel_atomic_global_obj_init(display, &display->bw.obj,
 				     &state->base, &intel_bw_funcs);
 
 	/*

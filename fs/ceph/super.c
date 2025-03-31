@@ -431,6 +431,8 @@ static int ceph_parse_mount_param(struct fs_context *fc,
 
 	switch (token) {
 	case Opt_snapdirname:
+		if (strlen(param->string) > NAME_MAX)
+			return invalfc(fc, "snapdirname too long");
 		kfree(fsopt->snapdir_name);
 		fsopt->snapdir_name = param->string;
 		param->string = NULL;
@@ -1560,6 +1562,17 @@ static void ceph_kill_sb(struct super_block *s)
 	 * evict the inodes later.
 	 */
 	sync_filesystem(s);
+
+	if (atomic64_read(&mdsc->dirty_folios) > 0) {
+		wait_queue_head_t *wq = &mdsc->flush_end_wq;
+		long timeleft = wait_event_killable_timeout(*wq,
+					atomic64_read(&mdsc->dirty_folios) <= 0,
+					fsc->client->options->mount_timeout);
+		if (!timeleft) /* timed out */
+			pr_warn_client(cl, "umount timed out, %ld\n", timeleft);
+		else if (timeleft < 0) /* killed */
+			pr_warn_client(cl, "umount was killed, %ld\n", timeleft);
+	}
 
 	spin_lock(&mdsc->stopping_lock);
 	mdsc->stopping = CEPH_MDSC_STOPPING_FLUSHING;

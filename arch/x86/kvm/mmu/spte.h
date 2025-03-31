@@ -276,6 +276,11 @@ static inline struct kvm_mmu_page *root_to_sp(hpa_t root)
 	return spte_to_child_sp(root);
 }
 
+static inline bool is_mirror_sptep(tdp_ptep_t sptep)
+{
+	return is_mirror_sp(sptep_to_sp(rcu_dereference(sptep)));
+}
+
 static inline bool is_mmio_spte(struct kvm *kvm, u64 spte)
 {
 	return (spte & shadow_mmio_mask) == kvm->arch.shadow_mmio_value &&
@@ -462,6 +467,23 @@ static inline bool is_mmu_writable_spte(u64 spte)
 }
 
 /*
+ * Returns true if the access indicated by @fault is allowed by the existing
+ * SPTE protections.  Note, the caller is responsible for checking that the
+ * SPTE is a shadow-present, leaf SPTE (either before or after).
+ */
+static inline bool is_access_allowed(struct kvm_page_fault *fault, u64 spte)
+{
+	if (fault->exec)
+		return is_executable_pte(spte);
+
+	if (fault->write)
+		return is_writable_pte(spte);
+
+	/* Fault was on Read access */
+	return spte & PT_PRESENT_MASK;
+}
+
+/*
  * If the MMU-writable flag is cleared, i.e. the SPTE is write-protected for
  * write-tracking, remote TLBs must be flushed, even if the SPTE was read-only,
  * as KVM allows stale Writable TLB entries to exist.  When dirty logging, KVM
@@ -497,7 +519,7 @@ static inline u64 get_mmio_spte_generation(u64 spte)
 	return gen;
 }
 
-bool spte_has_volatile_bits(u64 spte);
+bool spte_needs_atomic_update(u64 spte);
 
 bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 	       const struct kvm_memory_slot *slot,
