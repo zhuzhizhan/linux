@@ -52,7 +52,7 @@
 	__section(".discard") __attribute__((unused))
 
 /*
- * s390 and alpha modules require percpu variables to be defined as
+ * alpha modules require percpu variables to be defined as
  * weak to force the compiler to generate GOT based external
  * references for them.  This is necessary because percpu sections
  * will be located outside of the usually addressable area.
@@ -63,14 +63,10 @@
  * 1. The symbol must be globally unique, even the static ones.
  * 2. Static percpu variables cannot be defined inside a function.
  *
- * Archs which need weak percpu definitions should define
- * ARCH_NEEDS_WEAK_PER_CPU in asm/percpu.h when necessary.
- *
- * To ensure that the generic code observes the above two
- * restrictions, if CONFIG_DEBUG_FORCE_WEAK_PER_CPU is set weak
- * definition is used for all cases.
+ * Archs which need weak percpu definitions should set
+ * CONFIG_ARCH_MODULE_NEEDS_WEAK_PER_CPU when necessary.
  */
-#if defined(ARCH_NEEDS_WEAK_PER_CPU) || defined(CONFIG_DEBUG_FORCE_WEAK_PER_CPU)
+#if defined(CONFIG_ARCH_MODULE_NEEDS_WEAK_PER_CPU) && defined(MODULE)
 /*
  * __pcpu_scope_* dummy variable is used to enforce scope.  It
  * receives the static modifier when it's used in front of
@@ -202,7 +198,7 @@
 /*
  * Accessors and operations.
  */
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 /*
  * __verify_pcpu_ptr() verifies @ptr is a percpu pointer without evaluating
@@ -222,7 +218,7 @@ do {									\
 } while (0)
 
 #define PERCPU_PTR(__p)							\
-	(typeof(*(__p)) __force __kernel *)((__force unsigned long)(__p))
+	(TYPEOF_UNQUAL(*(__p)) __force __kernel *)((__force unsigned long)(__p))
 
 #ifdef CONFIG_SMP
 
@@ -318,7 +314,7 @@ static __always_inline void __this_cpu_preempt_check(const char *op) { }
 
 #define __pcpu_size_call_return(stem, variable)				\
 ({									\
-	typeof(variable) pscr_ret__;					\
+	TYPEOF_UNQUAL(variable) pscr_ret__;				\
 	__verify_pcpu_ptr(&(variable));					\
 	switch(sizeof(variable)) {					\
 	case 1: pscr_ret__ = stem##1(variable); break;			\
@@ -333,7 +329,7 @@ static __always_inline void __this_cpu_preempt_check(const char *op) { }
 
 #define __pcpu_size_call_return2(stem, variable, ...)			\
 ({									\
-	typeof(variable) pscr2_ret__;					\
+	TYPEOF_UNQUAL(variable) pscr2_ret__;				\
 	__verify_pcpu_ptr(&(variable));					\
 	switch(sizeof(variable)) {					\
 	case 1: pscr2_ret__ = stem##1(variable, __VA_ARGS__); break;	\
@@ -375,7 +371,7 @@ do {									\
 } while (0)
 
 /*
- * this_cpu operations (C) 2008-2013 Christoph Lameter <cl@linux.com>
+ * this_cpu operations (C) 2008-2013 Christoph Lameter <cl@gentwo.org>
  *
  * Optimized manipulation for memory allocated through the per cpu
  * allocator or for addresses of per cpu variables.
@@ -513,5 +509,5 @@ do {									\
 #define this_cpu_inc_return(pcp)	this_cpu_add_return(pcp, 1)
 #define this_cpu_dec_return(pcp)	this_cpu_add_return(pcp, -1)
 
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 #endif /* _LINUX_PERCPU_DEFS_H */

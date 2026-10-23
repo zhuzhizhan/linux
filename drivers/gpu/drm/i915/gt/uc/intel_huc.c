@@ -317,6 +317,11 @@ void intel_huc_init_early(struct intel_huc *huc)
 	}
 }
 
+void intel_huc_fini_late(struct intel_huc *huc)
+{
+	delayed_huc_load_fini(huc);
+}
+
 #define HUC_LOAD_MODE_STRING(x) (x ? "GSC" : "legacy")
 static int check_huc_loading_mode(struct intel_huc *huc)
 {
@@ -414,12 +419,6 @@ out:
 
 void intel_huc_fini(struct intel_huc *huc)
 {
-	/*
-	 * the fence is initialized in init_early, so we need to clean it up
-	 * even if HuC loading is off.
-	 */
-	delayed_huc_load_fini(huc);
-
 	if (huc->heci_pkt)
 		i915_vma_unpin_and_release(&huc->heci_pkt, 0);
 
@@ -541,10 +540,6 @@ int intel_huc_auth(struct intel_huc *huc, enum intel_huc_authentication_type typ
 
 	if (intel_huc_is_authenticated(huc, type))
 		return -EEXIST;
-
-	ret = i915_inject_probe_error(gt->i915, -ENXIO);
-	if (ret)
-		goto fail;
 
 	switch (type) {
 	case INTEL_HUC_AUTH_BY_GUC:

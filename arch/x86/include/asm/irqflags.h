@@ -25,7 +25,7 @@ extern __always_inline unsigned long native_save_fl(void)
 	 */
 	asm volatile("# __raw_save_flags\n\t"
 		     "pushf ; pop %0"
-		     : "=rm" (flags)
+		     : ASM_OUTPUT_RM (flags)
 		     : /* no input */
 		     : "memory");
 
@@ -44,13 +44,13 @@ static __always_inline void native_irq_enable(void)
 
 static __always_inline void native_safe_halt(void)
 {
-	mds_idle_clear_cpu_buffers();
+	x86_idle_clear_cpu_buffers();
 	asm volatile("sti; hlt": : :"memory");
 }
 
 static __always_inline void native_halt(void)
 {
-	mds_idle_clear_cpu_buffers();
+	x86_idle_clear_cpu_buffers();
 	asm volatile("hlt": : :"memory");
 }
 
@@ -76,27 +76,8 @@ static __always_inline void native_local_irq_restore(unsigned long flags)
 
 #endif
 
-#ifdef CONFIG_PARAVIRT_XXL
-#include <asm/paravirt.h>
-#else
+#ifndef CONFIG_PARAVIRT
 #ifndef __ASSEMBLER__
-#include <linux/types.h>
-
-static __always_inline unsigned long arch_local_save_flags(void)
-{
-	return native_save_fl();
-}
-
-static __always_inline void arch_local_irq_disable(void)
-{
-	native_irq_disable();
-}
-
-static __always_inline void arch_local_irq_enable(void)
-{
-	native_irq_enable();
-}
-
 /*
  * Used in the idle loop; sti takes one instruction cycle
  * to complete:
@@ -113,6 +94,29 @@ static __always_inline void arch_safe_halt(void)
 static __always_inline void halt(void)
 {
 	native_halt();
+}
+#endif /* __ASSEMBLER__ */
+#else
+#include <asm/paravirt.h>
+#endif /* CONFIG_PARAVIRT */
+
+#ifndef CONFIG_PARAVIRT_XXL
+#ifndef __ASSEMBLER__
+#include <linux/types.h>
+
+static __always_inline unsigned long arch_local_save_flags(void)
+{
+	return native_save_fl();
+}
+
+static __always_inline void arch_local_irq_disable(void)
+{
+	native_irq_disable();
+}
+
+static __always_inline void arch_local_irq_enable(void)
+{
+	native_irq_enable();
 }
 
 /*

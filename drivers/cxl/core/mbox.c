@@ -90,6 +90,10 @@ static struct cxl_mem_command cxl_mem_commands[CXL_MEM_COMMAND_ID_MAX] = {
  *
  * CXL_MBOX_OP_[GET_,INJECT_,CLEAR_]POISON: These commands require kernel
  * driver orchestration for safety.
+ *
+ * CXL_MBOX_OP_[GET_SUPPORTED_FEATURES,GET_FEATURE,SET_FEATURE]: Features are
+ * accessed through the fwctl ABI, which applies scope-based access control.
+ * The RAW path would bypass those checks, so it is not permitted here.
  */
 static u16 cxl_disabled_raw_commands[] = {
 	CXL_MBOX_OP_ACTIVATE_FW,
@@ -101,6 +105,9 @@ static u16 cxl_disabled_raw_commands[] = {
 	CXL_MBOX_OP_GET_POISON,
 	CXL_MBOX_OP_INJECT_POISON,
 	CXL_MBOX_OP_CLEAR_POISON,
+	CXL_MBOX_OP_GET_SUPPORTED_FEATURES,
+	CXL_MBOX_OP_GET_FEATURE,
+	CXL_MBOX_OP_SET_FEATURE,
 };
 
 /*
@@ -310,6 +317,7 @@ static bool cxl_mem_raw_command_allowed(u16 opcode)
  * cxl_payload_from_user_allowed() - Check contents of in_payload.
  * @opcode: The mailbox command opcode.
  * @payload_in: Pointer to the input payload passed in from user space.
+ * @in_size: Size of @payload_in in bytes.
  *
  * Return:
  *  * true	- payload_in passes check for @opcode.
@@ -324,12 +332,15 @@ static bool cxl_mem_raw_command_allowed(u16 opcode)
  *
  * The specific checks are determined by the opcode.
  */
-static bool cxl_payload_from_user_allowed(u16 opcode, void *payload_in)
+static bool cxl_payload_from_user_allowed(u16 opcode, void *payload_in,
+					  size_t in_size)
 {
 	switch (opcode) {
 	case CXL_MBOX_OP_SET_PARTITION_INFO: {
 		struct cxl_mbox_set_partition_info *pi = payload_in;
 
+		if (in_size < sizeof(*pi))
+			return false;
 		if (pi->flags & CXL_SET_PARTITION_IMMEDIATE_FLAG)
 			return false;
 		break;
@@ -337,6 +348,8 @@ static bool cxl_payload_from_user_allowed(u16 opcode, void *payload_in)
 	case CXL_MBOX_OP_CLEAR_LOG: {
 		const uuid_t *uuid = (uuid_t *)payload_in;
 
+		if (in_size < sizeof(uuid_t))
+			return false;
 		/*
 		 * Restrict the ‘Clear log’ action to only apply to
 		 * Vendor debug logs.
@@ -364,7 +377,8 @@ static int cxl_mbox_cmd_ctor(struct cxl_mbox_cmd *mbox_cmd,
 		if (IS_ERR(mbox_cmd->payload_in))
 			return PTR_ERR(mbox_cmd->payload_in);
 
-		if (!cxl_payload_from_user_allowed(opcode, mbox_cmd->payload_in)) {
+		if (!cxl_payload_from_user_allowed(opcode, mbox_cmd->payload_in,
+						  in_size)) {
 			dev_dbg(cxl_mbox->host, "%s: input payload not allowed\n",
 				cxl_mem_opcode_to_name(opcode));
 			kvfree(mbox_cmd->payload_in);
@@ -372,11 +386,7 @@ static int cxl_mbox_cmd_ctor(struct cxl_mbox_cmd *mbox_cmd,
 		}
 	}
 
-	/* Prepare to handle a full payload for variable sized output */
-	if (out_size == CXL_VARIABLE_PAYLOAD)
-		mbox_cmd->size_out = cxl_mbox->payload_size;
-	else
-		mbox_cmd->size_out = out_size;
+	mbox_cmd->size_out = min_t(size_t, out_size, cxl_mbox->payload_size);
 
 	if (mbox_cmd->size_out) {
 		mbox_cmd->payload_out = kvzalloc(mbox_cmd->size_out, GFP_KERNEL);
@@ -885,7 +895,7 @@ out:
 }
 EXPORT_SYMBOL_NS_GPL(cxl_enumerate_cmds, "CXL");
 
-void cxl_event_trace_record(const struct cxl_memdev *cxlmd,
+void cxl_event_trace_record(struct cxl_memdev *cxlmd,
 			    enum cxl_event_log_type type,
 			    enum cxl_event_type event_type,
 			    const uuid_t *uuid, union cxl_event *evt)
@@ -898,9 +908,13 @@ void cxl_event_trace_record(const struct cxl_memdev *cxlmd,
 		trace_cxl_generic_event(cxlmd, type, uuid, &evt->generic);
 		return;
 	}
+	if (event_type == CXL_CPER_EVENT_MEM_SPARING) {
+		trace_cxl_memory_sparing(cxlmd, type, &evt->mem_sparing);
+		return;
+	}
 
 	if (trace_cxl_general_media_enabled() || trace_cxl_dram_enabled()) {
-		u64 dpa, hpa = ULLONG_MAX;
+		u64 dpa, hpa = ULLONG_MAX, hpa_alias = ULLONG_MAX;
 		struct cxl_region *cxlr;
 
 		/*
@@ -908,24 +922,56 @@ void cxl_event_trace_record(const struct cxl_memdev *cxlmd,
 		 * translations. Take topology mutation locks and lookup
 		 * { HPA, REGION } from { DPA, MEMDEV } in the event record.
 		 */
-		guard(rwsem_read)(&cxl_region_rwsem);
-		guard(rwsem_read)(&cxl_dpa_rwsem);
+		guard(device)(&cxlmd->dev);
+		guard(rwsem_read)(&cxl_rwsem.region);
+		guard(rwsem_read)(&cxl_rwsem.dpa);
 
 		dpa = le64_to_cpu(evt->media_hdr.phys_addr) & CXL_DPA_MASK;
 		cxlr = cxl_dpa_to_region(cxlmd, dpa);
-		if (cxlr)
-			hpa = cxl_dpa_to_hpa(cxlr, cxlmd, dpa);
+		if (cxlr) {
+			u64 cache_size = cxlr->params.cache_size;
 
-		if (event_type == CXL_CPER_EVENT_GEN_MEDIA)
+			hpa = cxl_dpa_to_hpa(cxlr, cxlmd, dpa);
+			if (cache_size)
+				hpa_alias = hpa - cache_size;
+		}
+
+		if (event_type == CXL_CPER_EVENT_GEN_MEDIA) {
+			if (cxl_store_rec_gen_media((struct cxl_memdev *)cxlmd, evt))
+				dev_dbg(&cxlmd->dev, "CXL store rec_gen_media failed\n");
+
+			if (evt->gen_media.media_hdr.descriptor &
+			    CXL_GMER_EVT_DESC_THRESHOLD_EVENT)
+				WARN_ON_ONCE((evt->gen_media.media_hdr.type &
+					      CXL_GMER_MEM_EVT_TYPE_AP_CME_COUNTER_EXPIRE) &&
+					     !get_unaligned_le24(evt->gen_media.cme_count));
+			else
+				WARN_ON_ONCE(evt->gen_media.media_hdr.type &
+					     CXL_GMER_MEM_EVT_TYPE_AP_CME_COUNTER_EXPIRE);
+
 			trace_cxl_general_media(cxlmd, type, cxlr, hpa,
-						&evt->gen_media);
-		else if (event_type == CXL_CPER_EVENT_DRAM)
-			trace_cxl_dram(cxlmd, type, cxlr, hpa, &evt->dram);
+						hpa_alias, &evt->gen_media);
+		} else if (event_type == CXL_CPER_EVENT_DRAM) {
+			if (cxl_store_rec_dram((struct cxl_memdev *)cxlmd, evt))
+				dev_dbg(&cxlmd->dev, "CXL store rec_dram failed\n");
+
+			if (evt->dram.media_hdr.descriptor &
+			    CXL_GMER_EVT_DESC_THRESHOLD_EVENT)
+				WARN_ON_ONCE((evt->dram.media_hdr.type &
+					      CXL_DER_MEM_EVT_TYPE_AP_CME_COUNTER_EXPIRE) &&
+					     !get_unaligned_le24(evt->dram.cvme_count));
+			else
+				WARN_ON_ONCE(evt->dram.media_hdr.type &
+					     CXL_DER_MEM_EVT_TYPE_AP_CME_COUNTER_EXPIRE);
+
+			trace_cxl_dram(cxlmd, type, cxlr, hpa, hpa_alias,
+				       &evt->dram);
+		}
 	}
 }
 EXPORT_SYMBOL_NS_GPL(cxl_event_trace_record, "CXL");
 
-static void __cxl_event_trace_record(const struct cxl_memdev *cxlmd,
+static void __cxl_event_trace_record(struct cxl_memdev *cxlmd,
 				     enum cxl_event_log_type type,
 				     struct cxl_event_record_raw *record)
 {
@@ -938,6 +984,8 @@ static void __cxl_event_trace_record(const struct cxl_memdev *cxlmd,
 		ev_type = CXL_CPER_EVENT_DRAM;
 	else if (uuid_equal(uuid, &CXL_EVENT_MEM_MODULE_UUID))
 		ev_type = CXL_CPER_EVENT_MEM_MODULE;
+	else if (uuid_equal(uuid, &CXL_EVENT_MEM_SPARING_UUID))
+		ev_type = CXL_CPER_EVENT_MEM_SPARING;
 
 	cxl_event_trace_record(cxlmd, type, ev_type, uuid, &record->event);
 }
@@ -1106,7 +1154,7 @@ EXPORT_SYMBOL_NS_GPL(cxl_mem_get_event_records, "CXL");
  *
  * See CXL @8.2.9.5.2.1 Get Partition Info
  */
-static int cxl_mem_get_partition_info(struct cxl_memdev_state *mds)
+int cxl_mem_get_partition_info(struct cxl_memdev_state *mds)
 {
 	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
 	struct cxl_mbox_get_partition_info pi;
@@ -1126,10 +1174,6 @@ static int cxl_mem_get_partition_info(struct cxl_memdev_state *mds)
 		le64_to_cpu(pi.active_volatile_cap) * CXL_CAPACITY_MULTIPLIER;
 	mds->active_persistent_bytes =
 		le64_to_cpu(pi.active_persistent_cap) * CXL_CAPACITY_MULTIPLIER;
-	mds->next_volatile_bytes =
-		le64_to_cpu(pi.next_volatile_cap) * CXL_CAPACITY_MULTIPLIER;
-	mds->next_persistent_bytes =
-		le64_to_cpu(pi.next_volatile_cap) * CXL_CAPACITY_MULTIPLIER;
 
 	return 0;
 }
@@ -1251,91 +1295,59 @@ int cxl_mem_sanitize(struct cxl_memdev *cxlmd, u16 cmd)
 {
 	struct cxl_memdev_state *mds = to_cxl_memdev_state(cxlmd->cxlds);
 	struct cxl_port  *endpoint;
-	int rc;
 
 	/* synchronize with cxl_mem_probe() and decoder write operations */
 	guard(device)(&cxlmd->dev);
 	endpoint = cxlmd->endpoint;
-	down_read(&cxl_region_rwsem);
+	guard(rwsem_read)(&cxl_rwsem.region);
 	/*
 	 * Require an endpoint to be safe otherwise the driver can not
 	 * be sure that the device is unmapped.
 	 */
-	if (endpoint && cxl_num_decoders_committed(endpoint) == 0)
-		rc = __cxl_mem_sanitize(mds, cmd);
-	else
-		rc = -EBUSY;
-	up_read(&cxl_region_rwsem);
+	if (cxlmd->dev.driver && cxl_num_decoders_committed(endpoint) == 0)
+		return __cxl_mem_sanitize(mds, cmd);
+
+	return -EBUSY;
+}
+
+int cxl_get_dirty_count(struct cxl_memdev_state *mds, u32 *count)
+{
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	struct cxl_mbox_get_health_info_out hi;
+	struct cxl_mbox_cmd mbox_cmd;
+	int rc;
+
+	mbox_cmd = (struct cxl_mbox_cmd) {
+		.opcode = CXL_MBOX_OP_GET_HEALTH_INFO,
+		.size_out = sizeof(hi),
+		.payload_out = &hi,
+	};
+
+	rc = cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
+	if (!rc)
+		*count = le32_to_cpu(hi.dirty_shutdown_cnt);
 
 	return rc;
 }
+EXPORT_SYMBOL_NS_GPL(cxl_get_dirty_count, "CXL");
 
-static int add_dpa_res(struct device *dev, struct resource *parent,
-		       struct resource *res, resource_size_t start,
-		       resource_size_t size, const char *type)
+int cxl_arm_dirty_shutdown(struct cxl_memdev_state *mds)
 {
-	int rc;
+	struct cxl_mailbox *cxl_mbox = &mds->cxlds.cxl_mbox;
+	struct cxl_mbox_cmd mbox_cmd;
+	struct cxl_mbox_set_shutdown_state_in in = {
+		.state = 1
+	};
 
-	res->name = type;
-	res->start = start;
-	res->end = start + size - 1;
-	res->flags = IORESOURCE_MEM;
-	if (resource_size(res) == 0) {
-		dev_dbg(dev, "DPA(%s): no capacity\n", res->name);
-		return 0;
-	}
-	rc = request_resource(parent, res);
-	if (rc) {
-		dev_err(dev, "DPA(%s): failed to track %pr (%d)\n", res->name,
-			res, rc);
-		return rc;
-	}
+	mbox_cmd = (struct cxl_mbox_cmd) {
+		.opcode = CXL_MBOX_OP_SET_SHUTDOWN_STATE,
+		.size_in = sizeof(in),
+		.payload_in = &in,
+	};
 
-	dev_dbg(dev, "DPA(%s): %pr\n", res->name, res);
-
-	return 0;
+	return cxl_internal_send_cmd(cxl_mbox, &mbox_cmd);
 }
-
-int cxl_mem_create_range_info(struct cxl_memdev_state *mds)
-{
-	struct cxl_dev_state *cxlds = &mds->cxlds;
-	struct device *dev = cxlds->dev;
-	int rc;
-
-	if (!cxlds->media_ready) {
-		cxlds->dpa_res = DEFINE_RES_MEM(0, 0);
-		cxlds->ram_res = DEFINE_RES_MEM(0, 0);
-		cxlds->pmem_res = DEFINE_RES_MEM(0, 0);
-		return 0;
-	}
-
-	cxlds->dpa_res = DEFINE_RES_MEM(0, mds->total_bytes);
-
-	if (mds->partition_align_bytes == 0) {
-		rc = add_dpa_res(dev, &cxlds->dpa_res, &cxlds->ram_res, 0,
-				 mds->volatile_only_bytes, "ram");
-		if (rc)
-			return rc;
-		return add_dpa_res(dev, &cxlds->dpa_res, &cxlds->pmem_res,
-				   mds->volatile_only_bytes,
-				   mds->persistent_only_bytes, "pmem");
-	}
-
-	rc = cxl_mem_get_partition_info(mds);
-	if (rc) {
-		dev_err(dev, "Failed to query partition information\n");
-		return rc;
-	}
-
-	rc = add_dpa_res(dev, &cxlds->dpa_res, &cxlds->ram_res, 0,
-			 mds->active_volatile_bytes, "ram");
-	if (rc)
-		return rc;
-	return add_dpa_res(dev, &cxlds->dpa_res, &cxlds->pmem_res,
-			   mds->active_volatile_bytes,
-			   mds->active_persistent_bytes, "pmem");
-}
-EXPORT_SYMBOL_NS_GPL(cxl_mem_create_range_info, "CXL");
+EXPORT_SYMBOL_NS_GPL(cxl_arm_dirty_shutdown, "CXL");
 
 int cxl_set_timestamp(struct cxl_memdev_state *mds)
 {
@@ -1374,8 +1386,8 @@ int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
 	int nr_records = 0;
 	int rc;
 
-	rc = mutex_lock_interruptible(&mds->poison.lock);
-	if (rc)
+	ACQUIRE(mutex_intr, lock)(&mds->poison.mutex);
+	if ((rc = ACQUIRE_ERR(mutex_intr, &lock)))
 		return rc;
 
 	po = mds->poison.list_out;
@@ -1396,6 +1408,11 @@ int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
 		if (rc)
 			break;
 
+		if (!le16_to_cpu(po->count)) {
+			dev_dbg(&cxlmd->dev, "Poison empty payload!\n");
+			break;
+		}
+
 		for (int i = 0; i < le16_to_cpu(po->count); i++)
 			trace_cxl_poison(cxlmd, cxlr, &po->record[i],
 					 po->flags, po->overflow_ts,
@@ -1410,7 +1427,6 @@ int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
 		}
 	} while (po->flags & CXL_POISON_FLAG_MORE);
 
-	mutex_unlock(&mds->poison.lock);
 	return rc;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_mem_get_poison, "CXL");
@@ -1446,7 +1462,7 @@ int cxl_poison_state_init(struct cxl_memdev_state *mds)
 		return rc;
 	}
 
-	mutex_init(&mds->poison.lock);
+	mutex_init(&mds->poison.mutex);
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_poison_state_init, "CXL");
@@ -1458,30 +1474,27 @@ int cxl_mailbox_init(struct cxl_mailbox *cxl_mbox, struct device *host)
 
 	cxl_mbox->host = host;
 	mutex_init(&cxl_mbox->mbox_mutex);
+	mutex_init(&cxl_mbox->feat_mutex);
 	rcuwait_init(&cxl_mbox->mbox_wait);
 
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(cxl_mailbox_init, "CXL");
 
-struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev)
+struct cxl_memdev_state *cxl_memdev_state_create(struct device *dev, u64 serial,
+						 u16 dvsec)
 {
 	struct cxl_memdev_state *mds;
 
-	mds = devm_kzalloc(dev, sizeof(*mds), GFP_KERNEL);
+	mds = devm_cxl_dev_state_create(dev, CXL_DEVTYPE_CLASSMEM, serial,
+					dvsec, struct cxl_memdev_state, cxlds,
+					true);
 	if (!mds) {
 		dev_err(dev, "No memory available\n");
 		return ERR_PTR(-ENOMEM);
 	}
 
 	mutex_init(&mds->event.log_lock);
-	mds->cxlds.dev = dev;
-	mds->cxlds.reg_map.host = dev;
-	mds->cxlds.cxl_mbox.host = dev;
-	mds->cxlds.reg_map.resource = CXL_RESOURCE_NONE;
-	mds->cxlds.type = CXL_DEVTYPE_CLASSMEM;
-	mds->ram_perf.qos_class = CXL_QOS_CLASS_INVALID;
-	mds->pmem_perf.qos_class = CXL_QOS_CLASS_INVALID;
 
 	return mds;
 }

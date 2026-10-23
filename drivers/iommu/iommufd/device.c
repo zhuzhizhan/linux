@@ -3,9 +3,9 @@
  */
 #include <linux/iommu.h>
 #include <linux/iommufd.h>
+#include <linux/pci-ats.h>
 #include <linux/slab.h>
 #include <uapi/linux/iommufd.h>
-#include <linux/msi.h>
 
 #include "../iommu-priv.h"
 #include "io_pagetable.h"
@@ -18,16 +18,36 @@ MODULE_PARM_DESC(
 	"Allow IOMMUFD to bind to devices even if the platform cannot isolate "
 	"the MSI interrupt window. Enabling this is a security weakness.");
 
+struct iommufd_attach {
+	struct iommufd_hw_pagetable *hwpt;
+	struct xarray device_array;
+};
+
+/*
+ * Detect a noiommu device for the cdev path. We check dev->iommu rather than
+ * using device_iommu_mapped() (which checks dev->iommu_group) because when
+ * both group and cdev interfaces coexist, the group path assigns a fake
+ * noiommu iommu_group to the device. That would cause device_iommu_mapped()
+ * to return true and hide the noiommu case from the cdev path. dev->iommu is
+ * reliably NULL when no IOMMU driver is managing the device.
+ */
+static bool iommufd_device_is_noiommu(struct iommufd_device *idev)
+{
+	return IS_ENABLED(CONFIG_IOMMUFD_NOIOMMU) && !idev->dev->iommu;
+}
+
 static void iommufd_group_release(struct kref *kref)
 {
 	struct iommufd_group *igroup =
 		container_of(kref, struct iommufd_group, ref);
 
-	WARN_ON(igroup->hwpt || !list_empty(&igroup->device_list));
+	WARN_ON(!xa_empty(&igroup->pasid_attach));
 
-	xa_cmpxchg(&igroup->ictx->groups, iommu_group_id(igroup->group), igroup,
-		   NULL, GFP_KERNEL);
-	iommu_group_put(igroup->group);
+	if (igroup->group) {
+		xa_cmpxchg(&igroup->ictx->groups, iommu_group_id(igroup->group),
+			   igroup, NULL, GFP_KERNEL);
+		iommu_group_put(igroup->group);
+	}
 	mutex_destroy(&igroup->lock);
 	kfree(igroup);
 }
@@ -49,6 +69,30 @@ static bool iommufd_group_try_get(struct iommufd_group *igroup,
 	if (WARN_ON(igroup->group != group))
 		return false;
 	return kref_get_unless_zero(&igroup->ref);
+}
+
+static struct iommufd_group *iommufd_alloc_group(struct iommufd_ctx *ictx,
+						 struct iommu_group *group)
+{
+	struct iommufd_group *new_igroup;
+
+	new_igroup = kzalloc_obj(*new_igroup);
+	if (!new_igroup)
+		return ERR_PTR(-ENOMEM);
+
+	kref_init(&new_igroup->ref);
+	mutex_init(&new_igroup->lock);
+	xa_init(&new_igroup->pasid_attach);
+	new_igroup->sw_msi_start = PHYS_ADDR_MAX;
+	/* group reference moves into new_igroup */
+	new_igroup->group = group;
+
+	/*
+	 * The ictx is not additionally refcounted here because all objects using
+	 * an igroup must put it before their destroy completes.
+	 */
+	new_igroup->ictx = ictx;
+	return new_igroup;
 }
 
 /*
@@ -82,24 +126,11 @@ static struct iommufd_group *iommufd_get_group(struct iommufd_ctx *ictx,
 	}
 	xa_unlock(&ictx->groups);
 
-	new_igroup = kzalloc(sizeof(*new_igroup), GFP_KERNEL);
-	if (!new_igroup) {
+	new_igroup = iommufd_alloc_group(ictx, group);
+	if (IS_ERR(new_igroup)) {
 		iommu_group_put(group);
-		return ERR_PTR(-ENOMEM);
+		return new_igroup;
 	}
-
-	kref_init(&new_igroup->ref);
-	mutex_init(&new_igroup->lock);
-	INIT_LIST_HEAD(&new_igroup->device_list);
-	new_igroup->sw_msi_start = PHYS_ADDR_MAX;
-	/* group reference moves into new_igroup */
-	new_igroup->group = group;
-
-	/*
-	 * The ictx is not additionally refcounted here becase all objects using
-	 * an igroup must put it before their destroy completes.
-	 */
-	new_igroup->ictx = ictx;
 
 	/*
 	 * We dropped the lock so igroup is invalid. NULL is a safe and likely
@@ -132,37 +163,69 @@ static struct iommufd_group *iommufd_get_group(struct iommufd_ctx *ictx,
 	}
 }
 
+static void iommufd_device_remove_vdev(struct iommufd_device *idev)
+{
+	struct iommufd_vdevice *vdev;
+
+	mutex_lock(&idev->igroup->lock);
+	/* prevent new references from vdev */
+	idev->destroying = true;
+	/* vdev has been completely destroyed by userspace */
+	if (!idev->vdev)
+		goto out_unlock;
+
+	vdev = idev->vdev;
+
+	/*
+	 * An ongoing vdev destroy ioctl has removed the vdev from the object
+	 * xarray, but has not finished iommufd_vdevice_destroy() yet as it
+	 * needs the same mutex. We exit the locking then wait on wait_cnt
+	 * reference for the vdev destruction.
+	 */
+	if (iommufd_try_inc_users(idev->ictx, &vdev->obj))
+		goto out_unlock;
+
+	/*
+	 * vdev is still alive. Hold a users refcount to prevent racing with
+	 * userspace destruction, then use iommufd_object_tombstone_user() to
+	 * destroy it and leave a tombstone.
+	 */
+	mutex_unlock(&idev->igroup->lock);
+	iommufd_object_tombstone_user(idev->ictx, &vdev->obj);
+	return;
+
+out_unlock:
+	mutex_unlock(&idev->igroup->lock);
+}
+
+void iommufd_device_pre_destroy(struct iommufd_object *obj)
+{
+	struct iommufd_device *idev =
+		container_of(obj, struct iommufd_device, obj);
+
+	/* Release the wait_cnt reference on this */
+	iommufd_device_remove_vdev(idev);
+}
+
 void iommufd_device_destroy(struct iommufd_object *obj)
 {
 	struct iommufd_device *idev =
 		container_of(obj, struct iommufd_device, obj);
 
-	iommu_device_release_dma_owner(idev->dev);
+	/* igroup is NULL when destroy called during bind error cleanup */
+	if (!idev->igroup)
+		return;
+	if (!iommufd_device_is_noiommu(idev))
+		iommu_device_release_dma_owner(idev->dev);
 	iommufd_put_group(idev->igroup);
 	if (!iommufd_selftest_is_mock_dev(idev->dev))
 		iommufd_ctx_put(idev->ictx);
 }
 
-/**
- * iommufd_device_bind - Bind a physical device to an iommu fd
- * @ictx: iommufd file descriptor
- * @dev: Pointer to a physical device struct
- * @id: Output ID number to return to userspace for this device
- *
- * A successful bind establishes an ownership over the device and returns
- * struct iommufd_device pointer, otherwise returns error pointer.
- *
- * A driver using this API must set driver_managed_dma and must not touch
- * the device until this routine succeeds and establishes ownership.
- *
- * Binding a PCI device places the entire RID under iommufd control.
- *
- * The caller must undo this with iommufd_device_unbind()
- */
-struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
-					   struct device *dev, u32 *id)
+static int iommufd_bind_iommu(struct iommufd_device *idev)
 {
-	struct iommufd_device *idev;
+	struct iommufd_ctx *ictx = idev->ictx;
+	struct device *dev = idev->dev;
 	struct iommufd_group *igroup;
 	int rc;
 
@@ -171,11 +234,11 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 	 * to restore cache coherency.
 	 */
 	if (!device_iommu_capable(dev, IOMMU_CAP_CACHE_COHERENCY))
-		return ERR_PTR(-EINVAL);
+		return -EINVAL;
 
 	igroup = iommufd_get_group(ictx, dev);
 	if (IS_ERR(igroup))
-		return ERR_CAST(igroup);
+		return PTR_ERR(igroup);
 
 	/*
 	 * For historical compat with VFIO the insecure interrupt path is
@@ -201,22 +264,77 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 	if (rc)
 		goto out_group_put;
 
-	idev = iommufd_object_alloc(ictx, idev, IOMMUFD_OBJ_DEVICE);
-	if (IS_ERR(idev)) {
-		rc = PTR_ERR(idev);
-		goto out_release_owner;
-	}
-	idev->ictx = ictx;
-	if (!iommufd_selftest_is_mock_dev(dev))
-		iommufd_ctx_get(ictx);
-	idev->dev = dev;
-	idev->enforce_cache_coherency =
-		device_iommu_capable(dev, IOMMU_CAP_ENFORCE_CACHE_COHERENCY);
-	/* The calling driver is a user until iommufd_device_unbind() */
-	refcount_inc(&idev->obj.users);
 	/* igroup refcount moves into iommufd_device */
 	idev->igroup = igroup;
-	mutex_init(&idev->iopf_lock);
+	idev->enforce_cache_coherency =
+		device_iommu_capable(dev, IOMMU_CAP_ENFORCE_CACHE_COHERENCY);
+	return 0;
+
+out_group_put:
+	iommufd_put_group(igroup);
+	return rc;
+}
+
+/*
+ * Noiommu devices have no real IOMMU group. Create a dummy igroup so that
+ * internal code paths that expect idev->igroup to be present still work.
+ * A NULL igroup->group distinguishes this from a real IOMMU-backed group.
+ */
+static int iommufd_bind_noiommu(struct iommufd_device *idev)
+{
+	struct iommufd_group *igroup;
+
+	igroup = iommufd_alloc_group(idev->ictx, NULL);
+	if (IS_ERR(igroup))
+		return PTR_ERR(igroup);
+	idev->igroup = igroup;
+	return 0;
+}
+
+/**
+ * iommufd_device_bind - Bind a physical device to an iommu fd
+ * @ictx: iommufd file descriptor
+ * @dev: Pointer to a physical device struct
+ * @id: Output ID number to return to userspace for this device
+ *
+ * A successful bind establishes an ownership over the device and returns
+ * struct iommufd_device pointer, otherwise returns error pointer.
+ *
+ * A driver using this API must set driver_managed_dma and must not touch
+ * the device until this routine succeeds and establishes ownership.
+ *
+ * Binding a PCI device places the entire RID under iommufd control.
+ *
+ * The caller must undo this with iommufd_device_unbind()
+ */
+struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
+					   struct device *dev, u32 *id)
+{
+	struct iommufd_device *idev;
+	int rc;
+
+	idev = iommufd_object_alloc(ictx, idev, IOMMUFD_OBJ_DEVICE);
+	if (IS_ERR(idev))
+		return idev;
+
+	idev->ictx = ictx;
+	idev->dev = dev;
+
+	if (!iommufd_device_is_noiommu(idev))
+		rc = iommufd_bind_iommu(idev);
+	else
+		rc = iommufd_bind_noiommu(idev);
+	if (rc)
+		goto err_out;
+
+	/*
+	 * Take a ctx reference after bind succeeds. This must happen here
+	 * so that iommufd_device_destroy() can handle partial initialization
+	 */
+	if (!iommufd_selftest_is_mock_dev(dev))
+		iommufd_ctx_get(ictx);
+	/* The calling driver is a user until iommufd_device_unbind() */
+	refcount_inc(&idev->obj.users);
 
 	/*
 	 * If the caller fails after this success it must call
@@ -228,11 +346,14 @@ struct iommufd_device *iommufd_device_bind(struct iommufd_ctx *ictx,
 	*id = idev->obj.id;
 	return idev;
 
-out_release_owner:
-	iommu_device_release_dma_owner(dev);
-out_group_put:
-	iommufd_put_group(igroup);
+err_out:
+	/*
+	 * iommufd_device_destroy() handles partially initialized idev,
+	 * so iommufd_object_abort_and_destroy() is safe to call here.
+	 */
+	iommufd_object_abort_and_destroy(ictx, &idev->obj);
 	return ERR_PTR(rc);
+
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_device_bind, "IOMMUFD");
 
@@ -294,129 +415,24 @@ u32 iommufd_device_to_id(struct iommufd_device *idev)
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_device_to_id, "IOMMUFD");
 
-/*
- * Get a iommufd_sw_msi_map for the msi physical address requested by the irq
- * layer. The mapping to IOVA is global to the iommufd file descriptor, every
- * domain that is attached to a device using the same MSI parameters will use
- * the same IOVA.
- */
-static __maybe_unused struct iommufd_sw_msi_map *
-iommufd_sw_msi_get_map(struct iommufd_ctx *ictx, phys_addr_t msi_addr,
-		       phys_addr_t sw_msi_start)
+static unsigned int iommufd_group_device_num(struct iommufd_group *igroup,
+					     ioasid_t pasid)
 {
-	struct iommufd_sw_msi_map *cur;
-	unsigned int max_pgoff = 0;
+	struct iommufd_attach *attach;
+	struct iommufd_device *idev;
+	unsigned int count = 0;
+	unsigned long index;
 
-	lockdep_assert_held(&ictx->sw_msi_lock);
+	lockdep_assert_held(&igroup->lock);
 
-	list_for_each_entry(cur, &ictx->sw_msi_list, sw_msi_item) {
-		if (cur->sw_msi_start != sw_msi_start)
-			continue;
-		max_pgoff = max(max_pgoff, cur->pgoff + 1);
-		if (cur->msi_addr == msi_addr)
-			return cur;
-	}
-
-	if (ictx->sw_msi_id >=
-	    BITS_PER_BYTE * sizeof_field(struct iommufd_sw_msi_maps, bitmap))
-		return ERR_PTR(-EOVERFLOW);
-
-	cur = kzalloc(sizeof(*cur), GFP_KERNEL);
-	if (!cur)
-		return ERR_PTR(-ENOMEM);
-
-	cur->sw_msi_start = sw_msi_start;
-	cur->msi_addr = msi_addr;
-	cur->pgoff = max_pgoff;
-	cur->id = ictx->sw_msi_id++;
-	list_add_tail(&cur->sw_msi_item, &ictx->sw_msi_list);
-	return cur;
+	attach = xa_load(&igroup->pasid_attach, pasid);
+	if (attach)
+		xa_for_each(&attach->device_array, index, idev)
+			count++;
+	return count;
 }
 
-static int iommufd_sw_msi_install(struct iommufd_ctx *ictx,
-				  struct iommufd_hwpt_paging *hwpt_paging,
-				  struct iommufd_sw_msi_map *msi_map)
-{
-	unsigned long iova;
-
-	lockdep_assert_held(&ictx->sw_msi_lock);
-
-	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
-	if (!test_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap)) {
-		int rc;
-
-		rc = iommu_map(hwpt_paging->common.domain, iova,
-			       msi_map->msi_addr, PAGE_SIZE,
-			       IOMMU_WRITE | IOMMU_READ | IOMMU_MMIO,
-			       GFP_KERNEL_ACCOUNT);
-		if (rc)
-			return rc;
-		__set_bit(msi_map->id, hwpt_paging->present_sw_msi.bitmap);
-	}
-	return 0;
-}
-
-/*
- * Called by the irq code if the platform translates the MSI address through the
- * IOMMU. msi_addr is the physical address of the MSI page. iommufd will
- * allocate a fd global iova for the physical page that is the same on all
- * domains and devices.
- */
 #ifdef CONFIG_IRQ_MSI_IOMMU
-int iommufd_sw_msi(struct iommu_domain *domain, struct msi_desc *desc,
-		   phys_addr_t msi_addr)
-{
-	struct device *dev = msi_desc_to_dev(desc);
-	struct iommufd_hwpt_paging *hwpt_paging;
-	struct iommu_attach_handle *raw_handle;
-	struct iommufd_attach_handle *handle;
-	struct iommufd_sw_msi_map *msi_map;
-	struct iommufd_ctx *ictx;
-	unsigned long iova;
-	int rc;
-
-	/*
-	 * It is safe to call iommu_attach_handle_get() here because the iommu
-	 * core code invokes this under the group mutex which also prevents any
-	 * change of the attach handle for the duration of this function.
-	 */
-	iommu_group_mutex_assert(dev);
-
-	raw_handle =
-		iommu_attach_handle_get(dev->iommu_group, IOMMU_NO_PASID, 0);
-	if (IS_ERR(raw_handle))
-		return 0;
-	hwpt_paging = find_hwpt_paging(domain->iommufd_hwpt);
-
-	handle = to_iommufd_handle(raw_handle);
-	/* No IOMMU_RESV_SW_MSI means no change to the msi_msg */
-	if (handle->idev->igroup->sw_msi_start == PHYS_ADDR_MAX)
-		return 0;
-
-	ictx = handle->idev->ictx;
-	guard(mutex)(&ictx->sw_msi_lock);
-	/*
-	 * The input msi_addr is the exact byte offset of the MSI doorbell, we
-	 * assume the caller has checked that it is contained with a MMIO region
-	 * that is secure to map at PAGE_SIZE.
-	 */
-	msi_map = iommufd_sw_msi_get_map(handle->idev->ictx,
-					 msi_addr & PAGE_MASK,
-					 handle->idev->igroup->sw_msi_start);
-	if (IS_ERR(msi_map))
-		return PTR_ERR(msi_map);
-
-	rc = iommufd_sw_msi_install(ictx, hwpt_paging, msi_map);
-	if (rc)
-		return rc;
-	__set_bit(msi_map->id, handle->idev->igroup->required_sw_msi.bitmap);
-
-	iova = msi_map->sw_msi_start + msi_map->pgoff * PAGE_SIZE;
-	msi_desc_set_iommu_msi_iova(desc, iova, PAGE_SHIFT);
-	return 0;
-}
-#endif
-
 static int iommufd_group_setup_msi(struct iommufd_group *igroup,
 				   struct iommufd_hwpt_paging *hwpt_paging)
 {
@@ -443,23 +459,39 @@ static int iommufd_group_setup_msi(struct iommufd_group *igroup,
 	}
 	return 0;
 }
+#else
+static inline int
+iommufd_group_setup_msi(struct iommufd_group *igroup,
+			struct iommufd_hwpt_paging *hwpt_paging)
+{
+	return 0;
+}
+#endif
+
+static bool
+iommufd_group_first_attach(struct iommufd_group *igroup, ioasid_t pasid)
+{
+	lockdep_assert_held(&igroup->lock);
+	return !xa_load(&igroup->pasid_attach, pasid);
+}
 
 static int
 iommufd_device_attach_reserved_iova(struct iommufd_device *idev,
 				    struct iommufd_hwpt_paging *hwpt_paging)
 {
+	struct iommufd_group *igroup = idev->igroup;
 	int rc;
 
-	lockdep_assert_held(&idev->igroup->lock);
+	lockdep_assert_held(&igroup->lock);
 
 	rc = iopt_table_enforce_dev_resv_regions(&hwpt_paging->ioas->iopt,
 						 idev->dev,
-						 &idev->igroup->sw_msi_start);
+						 &igroup->sw_msi_start);
 	if (rc)
 		return rc;
 
-	if (list_empty(&idev->igroup->device_list)) {
-		rc = iommufd_group_setup_msi(idev->igroup, hwpt_paging);
+	if (iommufd_group_first_attach(igroup, IOMMU_NO_PASID)) {
+		rc = iommufd_group_setup_msi(igroup, hwpt_paging);
 		if (rc) {
 			iopt_remove_reserved_iova(&hwpt_paging->ioas->iopt,
 						  idev->dev);
@@ -471,126 +503,224 @@ iommufd_device_attach_reserved_iova(struct iommufd_device *idev,
 
 /* The device attach/detach/replace helpers for attach_handle */
 
+static bool iommufd_device_is_attached(struct iommufd_device *idev,
+				       ioasid_t pasid)
+{
+	struct iommufd_attach *attach;
+
+	attach = xa_load(&idev->igroup->pasid_attach, pasid);
+	return xa_load(&attach->device_array, idev->obj.id);
+}
+
+static int iommufd_hwpt_pasid_compat(struct iommufd_hw_pagetable *hwpt,
+				     struct iommufd_device *idev,
+				     ioasid_t pasid)
+{
+	struct iommufd_group *igroup = idev->igroup;
+
+	lockdep_assert_held(&igroup->lock);
+
+	if (pasid == IOMMU_NO_PASID) {
+		unsigned long start = IOMMU_NO_PASID;
+
+		if (!hwpt->pasid_compat &&
+		    xa_find_after(&igroup->pasid_attach,
+				  &start, UINT_MAX, XA_PRESENT))
+			return -EINVAL;
+	} else {
+		struct iommufd_attach *attach;
+
+		if (!hwpt->pasid_compat)
+			return -EINVAL;
+
+		attach = xa_load(&igroup->pasid_attach, IOMMU_NO_PASID);
+		if (attach && attach->hwpt && !attach->hwpt->pasid_compat)
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
+static bool iommufd_hwpt_compatible_device(struct iommufd_hw_pagetable *hwpt,
+					   struct iommufd_device *idev)
+{
+	struct pci_dev *pdev;
+
+	if (!hwpt->fault || !dev_is_pci(idev->dev))
+		return true;
+
+	/*
+	 * Once we turn on PCI/PRI support for VF, the response failure code
+	 * should not be forwarded to the hardware due to PRI being a shared
+	 * resource between PF and VFs. There is no coordination for this
+	 * shared capability. This waits for a vPRI reset to recover.
+	 */
+	pdev = to_pci_dev(idev->dev);
+
+	return (!pdev->is_virtfn || !pci_pri_supported(pdev));
+}
+
 static int iommufd_hwpt_attach_device(struct iommufd_hw_pagetable *hwpt,
-				      struct iommufd_device *idev)
+				      struct iommufd_device *idev,
+				      ioasid_t pasid)
 {
 	struct iommufd_attach_handle *handle;
 	int rc;
 
-	lockdep_assert_held(&idev->igroup->lock);
+	if (!iommufd_hwpt_compatible_device(hwpt, idev))
+		return -EINVAL;
 
-	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	rc = iommufd_hwpt_pasid_compat(hwpt, idev, pasid);
+	if (rc)
+		return rc;
+
+	if (iommufd_device_is_noiommu(idev))
+		return 0;
+
+	handle = kzalloc_obj(*handle);
 	if (!handle)
 		return -ENOMEM;
 
-	if (hwpt->fault) {
-		rc = iommufd_fault_iopf_enable(idev);
-		if (rc)
-			goto out_free_handle;
-	}
-
 	handle->idev = idev;
-	rc = iommu_attach_group_handle(hwpt->domain, idev->igroup->group,
-				       &handle->handle);
+	if (pasid == IOMMU_NO_PASID)
+		rc = iommu_attach_group_handle(hwpt->domain, idev->igroup->group,
+					       &handle->handle);
+	else
+		rc = iommu_attach_device_pasid(hwpt->domain, idev->dev, pasid,
+					       &handle->handle);
 	if (rc)
-		goto out_disable_iopf;
+		goto out_free_handle;
 
 	return 0;
 
-out_disable_iopf:
-	if (hwpt->fault)
-		iommufd_fault_iopf_disable(idev);
 out_free_handle:
 	kfree(handle);
 	return rc;
 }
 
 static struct iommufd_attach_handle *
-iommufd_device_get_attach_handle(struct iommufd_device *idev)
+iommufd_device_get_attach_handle(struct iommufd_device *idev, ioasid_t pasid)
 {
 	struct iommu_attach_handle *handle;
 
 	lockdep_assert_held(&idev->igroup->lock);
 
-	handle =
-		iommu_attach_handle_get(idev->igroup->group, IOMMU_NO_PASID, 0);
+	handle = iommu_attach_handle_get(idev->igroup->group, pasid, 0);
 	if (IS_ERR(handle))
 		return NULL;
 	return to_iommufd_handle(handle);
 }
 
 static void iommufd_hwpt_detach_device(struct iommufd_hw_pagetable *hwpt,
-				       struct iommufd_device *idev)
+				       struct iommufd_device *idev,
+				       ioasid_t pasid)
 {
 	struct iommufd_attach_handle *handle;
 
-	handle = iommufd_device_get_attach_handle(idev);
-	iommu_detach_group_handle(hwpt->domain, idev->igroup->group);
-	if (hwpt->fault) {
-		iommufd_auto_response_faults(hwpt, handle);
-		iommufd_fault_iopf_disable(idev);
-	}
+	if (iommufd_device_is_noiommu(idev))
+		return;
+
+	handle = iommufd_device_get_attach_handle(idev, pasid);
+	if (pasid == IOMMU_NO_PASID)
+		iommu_detach_group_handle(hwpt->domain, idev->igroup->group);
+	else
+		iommu_detach_device_pasid(hwpt->domain, idev->dev, pasid);
+
+	iommufd_auto_response_faults(hwpt, handle);
 	kfree(handle);
 }
 
 static int iommufd_hwpt_replace_device(struct iommufd_device *idev,
+				       ioasid_t pasid,
 				       struct iommufd_hw_pagetable *hwpt,
 				       struct iommufd_hw_pagetable *old)
 {
-	struct iommufd_attach_handle *handle, *old_handle =
-		iommufd_device_get_attach_handle(idev);
+	struct iommufd_attach_handle *handle, *old_handle;
 	int rc;
 
-	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!iommufd_hwpt_compatible_device(hwpt, idev))
+		return -EINVAL;
+
+	rc = iommufd_hwpt_pasid_compat(hwpt, idev, pasid);
+	if (rc)
+		return rc;
+
+	if (iommufd_device_is_noiommu(idev))
+		return 0;
+
+	old_handle = iommufd_device_get_attach_handle(idev, pasid);
+
+	handle = kzalloc_obj(*handle);
 	if (!handle)
 		return -ENOMEM;
 
-	if (hwpt->fault && !old->fault) {
-		rc = iommufd_fault_iopf_enable(idev);
-		if (rc)
-			goto out_free_handle;
-	}
-
 	handle->idev = idev;
-	rc = iommu_replace_group_handle(idev->igroup->group, hwpt->domain,
-					&handle->handle);
+	if (pasid == IOMMU_NO_PASID)
+		rc = iommu_replace_group_handle(idev->igroup->group,
+						hwpt->domain, &handle->handle);
+	else
+		rc = iommu_replace_device_pasid(hwpt->domain, idev->dev,
+						pasid, &handle->handle);
 	if (rc)
-		goto out_disable_iopf;
+		goto out_free_handle;
 
-	if (old->fault) {
-		iommufd_auto_response_faults(hwpt, old_handle);
-		if (!hwpt->fault)
-			iommufd_fault_iopf_disable(idev);
-	}
+	iommufd_auto_response_faults(old, old_handle);
 	kfree(old_handle);
 
 	return 0;
 
-out_disable_iopf:
-	if (hwpt->fault && !old->fault)
-		iommufd_fault_iopf_disable(idev);
 out_free_handle:
 	kfree(handle);
 	return rc;
 }
 
 int iommufd_hw_pagetable_attach(struct iommufd_hw_pagetable *hwpt,
-				struct iommufd_device *idev)
+				struct iommufd_device *idev, ioasid_t pasid)
 {
 	struct iommufd_hwpt_paging *hwpt_paging = find_hwpt_paging(hwpt);
+	bool attach_resv = hwpt_paging && pasid == IOMMU_NO_PASID &&
+			   !iommufd_device_is_noiommu(idev);
+	struct iommufd_group *igroup = idev->igroup;
+	struct iommufd_hw_pagetable *old_hwpt;
+	struct iommufd_attach *attach;
 	int rc;
 
-	mutex_lock(&idev->igroup->lock);
+	mutex_lock(&igroup->lock);
 
-	if (idev->igroup->hwpt != NULL && idev->igroup->hwpt != hwpt) {
-		rc = -EINVAL;
+	attach = xa_cmpxchg(&igroup->pasid_attach, pasid, NULL,
+			    XA_ZERO_ENTRY, GFP_KERNEL);
+	if (xa_is_err(attach)) {
+		rc = xa_err(attach);
 		goto err_unlock;
 	}
 
-	if (hwpt_paging) {
+	if (!attach) {
+		attach = kzalloc_obj(*attach);
+		if (!attach) {
+			rc = -ENOMEM;
+			goto err_release_pasid;
+		}
+		xa_init(&attach->device_array);
+	}
+
+	old_hwpt = attach->hwpt;
+
+	rc = xa_insert(&attach->device_array, idev->obj.id, XA_ZERO_ENTRY,
+		       GFP_KERNEL);
+	if (rc) {
+		WARN_ON(rc == -EBUSY && !old_hwpt);
+		goto err_free_attach;
+	}
+
+	if (old_hwpt && old_hwpt != hwpt) {
+		rc = -EINVAL;
+		goto err_release_devid;
+	}
+
+	if (attach_resv) {
 		rc = iommufd_device_attach_reserved_iova(idev, hwpt_paging);
 		if (rc)
-			goto err_unlock;
+			goto err_release_devid;
 	}
 
 	/*
@@ -600,51 +730,76 @@ int iommufd_hw_pagetable_attach(struct iommufd_hw_pagetable *hwpt,
 	 * reserved regions are only updated during individual device
 	 * attachment.
 	 */
-	if (list_empty(&idev->igroup->device_list)) {
-		rc = iommufd_hwpt_attach_device(hwpt, idev);
+	if (iommufd_group_first_attach(igroup, pasid)) {
+		rc = iommufd_hwpt_attach_device(hwpt, idev, pasid);
 		if (rc)
 			goto err_unresv;
-		idev->igroup->hwpt = hwpt;
+		attach->hwpt = hwpt;
+		WARN_ON(xa_is_err(xa_store(&igroup->pasid_attach, pasid, attach,
+					   GFP_KERNEL)));
 	}
 	refcount_inc(&hwpt->obj.users);
-	list_add_tail(&idev->group_item, &idev->igroup->device_list);
-	mutex_unlock(&idev->igroup->lock);
+	WARN_ON(xa_is_err(xa_store(&attach->device_array, idev->obj.id,
+				   idev, GFP_KERNEL)));
+	mutex_unlock(&igroup->lock);
 	return 0;
 err_unresv:
-	if (hwpt_paging)
+	if (attach_resv)
 		iopt_remove_reserved_iova(&hwpt_paging->ioas->iopt, idev->dev);
+err_release_devid:
+	xa_release(&attach->device_array, idev->obj.id);
+err_free_attach:
+	if (iommufd_group_first_attach(igroup, pasid))
+		kfree(attach);
+err_release_pasid:
+	if (iommufd_group_first_attach(igroup, pasid))
+		xa_release(&igroup->pasid_attach, pasid);
 err_unlock:
-	mutex_unlock(&idev->igroup->lock);
+	mutex_unlock(&igroup->lock);
 	return rc;
 }
 
 struct iommufd_hw_pagetable *
-iommufd_hw_pagetable_detach(struct iommufd_device *idev)
+iommufd_hw_pagetable_detach(struct iommufd_device *idev, ioasid_t pasid)
 {
-	struct iommufd_hw_pagetable *hwpt = idev->igroup->hwpt;
-	struct iommufd_hwpt_paging *hwpt_paging = find_hwpt_paging(hwpt);
+	struct iommufd_group *igroup = idev->igroup;
+	struct iommufd_hwpt_paging *hwpt_paging;
+	struct iommufd_hw_pagetable *hwpt;
+	struct iommufd_attach *attach;
 
-	mutex_lock(&idev->igroup->lock);
-	list_del(&idev->group_item);
-	if (list_empty(&idev->igroup->device_list)) {
-		iommufd_hwpt_detach_device(hwpt, idev);
-		idev->igroup->hwpt = NULL;
+	mutex_lock(&igroup->lock);
+	attach = xa_load(&igroup->pasid_attach, pasid);
+	if (!attach) {
+		mutex_unlock(&igroup->lock);
+		return NULL;
 	}
-	if (hwpt_paging)
+
+	hwpt = attach->hwpt;
+	hwpt_paging = find_hwpt_paging(hwpt);
+
+	xa_erase(&attach->device_array, idev->obj.id);
+	if (xa_empty(&attach->device_array)) {
+		iommufd_hwpt_detach_device(hwpt, idev, pasid);
+		xa_erase(&igroup->pasid_attach, pasid);
+		kfree(attach);
+	}
+	if (hwpt_paging && pasid == IOMMU_NO_PASID)
 		iopt_remove_reserved_iova(&hwpt_paging->ioas->iopt, idev->dev);
-	mutex_unlock(&idev->igroup->lock);
+	mutex_unlock(&igroup->lock);
+
+	iommufd_hw_pagetable_put(idev->ictx, hwpt);
 
 	/* Caller must destroy hwpt */
 	return hwpt;
 }
 
 static struct iommufd_hw_pagetable *
-iommufd_device_do_attach(struct iommufd_device *idev,
+iommufd_device_do_attach(struct iommufd_device *idev, ioasid_t pasid,
 			 struct iommufd_hw_pagetable *hwpt)
 {
 	int rc;
 
-	rc = iommufd_hw_pagetable_attach(hwpt, idev);
+	rc = iommufd_hw_pagetable_attach(hwpt, idev, pasid);
 	if (rc)
 		return ERR_PTR(rc);
 	return NULL;
@@ -654,11 +809,14 @@ static void
 iommufd_group_remove_reserved_iova(struct iommufd_group *igroup,
 				   struct iommufd_hwpt_paging *hwpt_paging)
 {
+	struct iommufd_attach *attach;
 	struct iommufd_device *cur;
+	unsigned long index;
 
 	lockdep_assert_held(&igroup->lock);
 
-	list_for_each_entry(cur, &igroup->device_list, group_item)
+	attach = xa_load(&igroup->pasid_attach, IOMMU_NO_PASID);
+	xa_for_each(&attach->device_array, index, cur)
 		iopt_remove_reserved_iova(&hwpt_paging->ioas->iopt, cur->dev);
 }
 
@@ -667,14 +825,17 @@ iommufd_group_do_replace_reserved_iova(struct iommufd_group *igroup,
 				       struct iommufd_hwpt_paging *hwpt_paging)
 {
 	struct iommufd_hwpt_paging *old_hwpt_paging;
+	struct iommufd_attach *attach;
 	struct iommufd_device *cur;
+	unsigned long index;
 	int rc;
 
 	lockdep_assert_held(&igroup->lock);
 
-	old_hwpt_paging = find_hwpt_paging(igroup->hwpt);
+	attach = xa_load(&igroup->pasid_attach, IOMMU_NO_PASID);
+	old_hwpt_paging = find_hwpt_paging(attach->hwpt);
 	if (!old_hwpt_paging || hwpt_paging->ioas != old_hwpt_paging->ioas) {
-		list_for_each_entry(cur, &igroup->device_list, group_item) {
+		xa_for_each(&attach->device_array, index, cur) {
 			rc = iopt_table_enforce_dev_resv_regions(
 				&hwpt_paging->ioas->iopt, cur->dev, NULL);
 			if (rc)
@@ -693,69 +854,82 @@ err_unresv:
 }
 
 static struct iommufd_hw_pagetable *
-iommufd_device_do_replace(struct iommufd_device *idev,
+iommufd_device_do_replace(struct iommufd_device *idev, ioasid_t pasid,
 			  struct iommufd_hw_pagetable *hwpt)
 {
 	struct iommufd_hwpt_paging *hwpt_paging = find_hwpt_paging(hwpt);
+	bool attach_resv = hwpt_paging && pasid == IOMMU_NO_PASID &&
+			   !iommufd_device_is_noiommu(idev);
 	struct iommufd_hwpt_paging *old_hwpt_paging;
 	struct iommufd_group *igroup = idev->igroup;
 	struct iommufd_hw_pagetable *old_hwpt;
+	struct iommufd_attach *attach;
 	unsigned int num_devices;
 	int rc;
 
-	mutex_lock(&idev->igroup->lock);
+	mutex_lock(&igroup->lock);
 
-	if (igroup->hwpt == NULL) {
+	attach = xa_load(&igroup->pasid_attach, pasid);
+	if (!attach) {
 		rc = -EINVAL;
 		goto err_unlock;
 	}
 
-	if (hwpt == igroup->hwpt) {
-		mutex_unlock(&idev->igroup->lock);
+	old_hwpt = attach->hwpt;
+
+	WARN_ON(!old_hwpt || xa_empty(&attach->device_array));
+
+	if (!iommufd_device_is_attached(idev, pasid)) {
+		rc = -EINVAL;
+		goto err_unlock;
+	}
+
+	if (hwpt == old_hwpt) {
+		mutex_unlock(&igroup->lock);
 		return NULL;
 	}
 
-	old_hwpt = igroup->hwpt;
-	if (hwpt_paging) {
+	if (attach_resv) {
 		rc = iommufd_group_do_replace_reserved_iova(igroup, hwpt_paging);
 		if (rc)
 			goto err_unlock;
 	}
 
-	rc = iommufd_hwpt_replace_device(idev, hwpt, old_hwpt);
+	rc = iommufd_hwpt_replace_device(idev, pasid, hwpt, old_hwpt);
 	if (rc)
 		goto err_unresv;
 
 	old_hwpt_paging = find_hwpt_paging(old_hwpt);
-	if (old_hwpt_paging &&
+	if (old_hwpt_paging && pasid == IOMMU_NO_PASID &&
 	    (!hwpt_paging || hwpt_paging->ioas != old_hwpt_paging->ioas))
 		iommufd_group_remove_reserved_iova(igroup, old_hwpt_paging);
 
-	igroup->hwpt = hwpt;
+	attach->hwpt = hwpt;
 
-	num_devices = list_count_nodes(&igroup->device_list);
+	num_devices = iommufd_group_device_num(igroup, pasid);
 	/*
-	 * Move the refcounts held by the device_list to the new hwpt. Retain a
+	 * Move the refcounts held by the device_array to the new hwpt. Retain a
 	 * refcount for this thread as the caller will free it.
 	 */
 	refcount_add(num_devices, &hwpt->obj.users);
 	if (num_devices > 1)
 		WARN_ON(refcount_sub_and_test(num_devices - 1,
 					      &old_hwpt->obj.users));
-	mutex_unlock(&idev->igroup->lock);
+	mutex_unlock(&igroup->lock);
 
 	/* Caller must destroy old_hwpt */
 	return old_hwpt;
 err_unresv:
-	if (hwpt_paging)
+	if (attach_resv)
 		iommufd_group_remove_reserved_iova(igroup, hwpt_paging);
 err_unlock:
-	mutex_unlock(&idev->igroup->lock);
+	mutex_unlock(&igroup->lock);
 	return ERR_PTR(rc);
 }
 
 typedef struct iommufd_hw_pagetable *(*attach_fn)(
-	struct iommufd_device *idev, struct iommufd_hw_pagetable *hwpt);
+	struct iommufd_device *idev, ioasid_t pasid,
+	struct iommufd_hw_pagetable *hwpt);
 
 /*
  * When automatically managing the domains we search for a compatible domain in
@@ -763,13 +937,13 @@ typedef struct iommufd_hw_pagetable *(*attach_fn)(
  * Automatic domain selection will never pick a manually created domain.
  */
 static struct iommufd_hw_pagetable *
-iommufd_device_auto_get_domain(struct iommufd_device *idev,
+iommufd_device_auto_get_domain(struct iommufd_device *idev, ioasid_t pasid,
 			       struct iommufd_ioas *ioas, u32 *pt_id,
 			       attach_fn do_attach)
 {
 	/*
 	 * iommufd_hw_pagetable_attach() is called by
-	 * iommufd_hw_pagetable_alloc() in immediate attachment mode, same as
+	 * iommufd_hwpt_paging_alloc() in immediate attachment mode, same as
 	 * iommufd_device_do_attach(). So if we are in this mode then we prefer
 	 * to use the immediate_attach path as it supports drivers that can't
 	 * directly allocate a domain.
@@ -792,7 +966,7 @@ iommufd_device_auto_get_domain(struct iommufd_device *idev,
 		hwpt = &hwpt_paging->common;
 		if (!iommufd_lock_obj(&hwpt->obj))
 			continue;
-		destroy_hwpt = (*do_attach)(idev, hwpt);
+		destroy_hwpt = (*do_attach)(idev, pasid, hwpt);
 		if (IS_ERR(destroy_hwpt)) {
 			iommufd_put_object(idev->ictx, &hwpt->obj);
 			/*
@@ -810,8 +984,8 @@ iommufd_device_auto_get_domain(struct iommufd_device *idev,
 		goto out_unlock;
 	}
 
-	hwpt_paging = iommufd_hwpt_paging_alloc(idev->ictx, ioas, idev, 0,
-						immediate_attach, NULL);
+	hwpt_paging = iommufd_hwpt_paging_alloc(idev->ictx, ioas, idev, pasid,
+						0, immediate_attach, NULL);
 	if (IS_ERR(hwpt_paging)) {
 		destroy_hwpt = ERR_CAST(hwpt_paging);
 		goto out_unlock;
@@ -819,7 +993,7 @@ iommufd_device_auto_get_domain(struct iommufd_device *idev,
 	hwpt = &hwpt_paging->common;
 
 	if (!immediate_attach) {
-		destroy_hwpt = (*do_attach)(idev, hwpt);
+		destroy_hwpt = (*do_attach)(idev, pasid, hwpt);
 		if (IS_ERR(destroy_hwpt))
 			goto out_abort;
 	} else {
@@ -840,8 +1014,9 @@ out_unlock:
 	return destroy_hwpt;
 }
 
-static int iommufd_device_change_pt(struct iommufd_device *idev, u32 *pt_id,
-				    attach_fn do_attach)
+static int iommufd_device_change_pt(struct iommufd_device *idev,
+				    ioasid_t pasid,
+				    u32 *pt_id, attach_fn do_attach)
 {
 	struct iommufd_hw_pagetable *destroy_hwpt;
 	struct iommufd_object *pt_obj;
@@ -856,7 +1031,7 @@ static int iommufd_device_change_pt(struct iommufd_device *idev, u32 *pt_id,
 		struct iommufd_hw_pagetable *hwpt =
 			container_of(pt_obj, struct iommufd_hw_pagetable, obj);
 
-		destroy_hwpt = (*do_attach)(idev, hwpt);
+		destroy_hwpt = (*do_attach)(idev, pasid, hwpt);
 		if (IS_ERR(destroy_hwpt))
 			goto out_put_pt_obj;
 		break;
@@ -865,8 +1040,8 @@ static int iommufd_device_change_pt(struct iommufd_device *idev, u32 *pt_id,
 		struct iommufd_ioas *ioas =
 			container_of(pt_obj, struct iommufd_ioas, obj);
 
-		destroy_hwpt = iommufd_device_auto_get_domain(idev, ioas, pt_id,
-							      do_attach);
+		destroy_hwpt = iommufd_device_auto_get_domain(idev, pasid, ioas,
+							      pt_id, do_attach);
 		if (IS_ERR(destroy_hwpt))
 			goto out_put_pt_obj;
 		break;
@@ -888,22 +1063,26 @@ out_put_pt_obj:
 }
 
 /**
- * iommufd_device_attach - Connect a device to an iommu_domain
+ * iommufd_device_attach - Connect a device/pasid to an iommu_domain
  * @idev: device to attach
- * @pt_id: Input a IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
+ * @pasid: pasid to attach
+ * @pt_id: Input an IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
  *         Output the IOMMUFD_OBJ_HWPT_PAGING ID
  *
- * This connects the device to an iommu_domain, either automatically or manually
- * selected. Once this completes the device could do DMA.
+ * This connects the device/pasid to an iommu_domain, either automatically
+ * or manually selected. Once this completes the device could do DMA with
+ * @pasid. @pasid is IOMMU_NO_PASID if this attach is for no pasid usage.
  *
  * The caller should return the resulting pt_id back to userspace.
  * This function is undone by calling iommufd_device_detach().
  */
-int iommufd_device_attach(struct iommufd_device *idev, u32 *pt_id)
+int iommufd_device_attach(struct iommufd_device *idev, ioasid_t pasid,
+			  u32 *pt_id)
 {
 	int rc;
 
-	rc = iommufd_device_change_pt(idev, pt_id, &iommufd_device_do_attach);
+	rc = iommufd_device_change_pt(idev, pasid, pt_id,
+				      &iommufd_device_do_attach);
 	if (rc)
 		return rc;
 
@@ -917,9 +1096,10 @@ int iommufd_device_attach(struct iommufd_device *idev, u32 *pt_id)
 EXPORT_SYMBOL_NS_GPL(iommufd_device_attach, "IOMMUFD");
 
 /**
- * iommufd_device_replace - Change the device's iommu_domain
+ * iommufd_device_replace - Change the device/pasid's iommu_domain
  * @idev: device to change
- * @pt_id: Input a IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
+ * @pasid: pasid to change
+ * @pt_id: Input an IOMMUFD_OBJ_IOAS, or IOMMUFD_OBJ_HWPT_PAGING
  *         Output the IOMMUFD_OBJ_HWPT_PAGING ID
  *
  * This is the same as::
@@ -929,28 +1109,33 @@ EXPORT_SYMBOL_NS_GPL(iommufd_device_attach, "IOMMUFD");
  *
  * If it fails then no change is made to the attachment. The iommu driver may
  * implement this so there is no disruption in translation. This can only be
- * called if iommufd_device_attach() has already succeeded.
+ * called if iommufd_device_attach() has already succeeded. @pasid is
+ * IOMMU_NO_PASID for no pasid usage.
  */
-int iommufd_device_replace(struct iommufd_device *idev, u32 *pt_id)
+int iommufd_device_replace(struct iommufd_device *idev, ioasid_t pasid,
+			   u32 *pt_id)
 {
-	return iommufd_device_change_pt(idev, pt_id,
+	return iommufd_device_change_pt(idev, pasid, pt_id,
 					&iommufd_device_do_replace);
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_device_replace, "IOMMUFD");
 
 /**
- * iommufd_device_detach - Disconnect a device to an iommu_domain
+ * iommufd_device_detach - Disconnect a device/pasid from an iommu_domain
  * @idev: device to detach
+ * @pasid: pasid to detach
  *
  * Undo iommufd_device_attach(). This disconnects the idev from the previously
  * attached pt_id. The device returns back to a blocked DMA translation.
+ * @pasid is IOMMU_NO_PASID for no pasid usage.
  */
-void iommufd_device_detach(struct iommufd_device *idev)
+void iommufd_device_detach(struct iommufd_device *idev, ioasid_t pasid)
 {
 	struct iommufd_hw_pagetable *hwpt;
 
-	hwpt = iommufd_hw_pagetable_detach(idev);
-	iommufd_hw_pagetable_put(idev->ictx, hwpt);
+	hwpt = iommufd_hw_pagetable_detach(idev, pasid);
+	if (!hwpt)
+		return;
 	refcount_dec(&idev->obj.users);
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_device_detach, "IOMMUFD");
@@ -992,7 +1177,7 @@ static int iommufd_access_change_ioas(struct iommufd_access *access,
 	}
 
 	if (cur_ioas) {
-		if (access->ops->unmap) {
+		if (!iommufd_access_is_internal(access) && access->ops->unmap) {
 			mutex_unlock(&access->ioas_lock);
 			access->ops->unmap(access->data, 0, ULONG_MAX);
 			mutex_lock(&access->ioas_lock);
@@ -1028,7 +1213,39 @@ void iommufd_access_destroy_object(struct iommufd_object *obj)
 	if (access->ioas)
 		WARN_ON(iommufd_access_change_ioas(access, NULL));
 	mutex_unlock(&access->ioas_lock);
-	iommufd_ctx_put(access->ictx);
+	if (!iommufd_access_is_internal(access))
+		iommufd_ctx_put(access->ictx);
+}
+
+static struct iommufd_access *__iommufd_access_create(struct iommufd_ctx *ictx)
+{
+	struct iommufd_access *access;
+
+	/*
+	 * There is no uAPI for the access object, but to keep things symmetric
+	 * use the object infrastructure anyhow.
+	 */
+	access = iommufd_object_alloc(ictx, access, IOMMUFD_OBJ_ACCESS);
+	if (IS_ERR(access))
+		return access;
+
+	/* The calling driver is a user until iommufd_access_destroy() */
+	refcount_inc(&access->obj.users);
+	mutex_init(&access->ioas_lock);
+	return access;
+}
+
+struct iommufd_access *iommufd_access_create_internal(struct iommufd_ctx *ictx)
+{
+	struct iommufd_access *access;
+
+	access = __iommufd_access_create(ictx);
+	if (IS_ERR(access))
+		return access;
+	access->iova_alignment = PAGE_SIZE;
+
+	iommufd_object_finalize(ictx, &access->obj);
+	return access;
 }
 
 /**
@@ -1050,11 +1267,7 @@ iommufd_access_create(struct iommufd_ctx *ictx,
 {
 	struct iommufd_access *access;
 
-	/*
-	 * There is no uAPI for the access object, but to keep things symmetric
-	 * use the object infrastructure anyhow.
-	 */
-	access = iommufd_object_alloc(ictx, access, IOMMUFD_OBJ_ACCESS);
+	access = __iommufd_access_create(ictx);
 	if (IS_ERR(access))
 		return access;
 
@@ -1066,13 +1279,10 @@ iommufd_access_create(struct iommufd_ctx *ictx,
 	else
 		access->iova_alignment = 1;
 
-	/* The calling driver is a user until iommufd_access_destroy() */
-	refcount_inc(&access->obj.users);
 	access->ictx = ictx;
 	iommufd_ctx_get(ictx);
 	iommufd_object_finalize(ictx, &access->obj);
 	*id = access->obj.id;
-	mutex_init(&access->ioas_lock);
 	return access;
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_access_create, "IOMMUFD");
@@ -1117,6 +1327,22 @@ int iommufd_access_attach(struct iommufd_access *access, u32 ioas_id)
 }
 EXPORT_SYMBOL_NS_GPL(iommufd_access_attach, "IOMMUFD");
 
+int iommufd_access_attach_internal(struct iommufd_access *access,
+				   struct iommufd_ioas *ioas)
+{
+	int rc;
+
+	mutex_lock(&access->ioas_lock);
+	if (WARN_ON(access->ioas)) {
+		mutex_unlock(&access->ioas_lock);
+		return -EINVAL;
+	}
+
+	rc = iommufd_access_change_ioas(access, ioas);
+	mutex_unlock(&access->ioas_lock);
+	return rc;
+}
+
 int iommufd_access_replace(struct iommufd_access *access, u32 ioas_id)
 {
 	int rc;
@@ -1158,7 +1384,8 @@ void iommufd_access_notify_unmap(struct io_pagetable *iopt, unsigned long iova,
 
 	xa_lock(&ioas->iopt.access_list);
 	xa_for_each(&ioas->iopt.access_list, index, access) {
-		if (!iommufd_lock_obj(&access->obj))
+		if (iommufd_access_is_internal(access) ||
+		    !iommufd_lock_obj(&access->obj))
 			continue;
 		xa_unlock(&ioas->iopt.access_list);
 
@@ -1182,6 +1409,7 @@ void iommufd_access_notify_unmap(struct io_pagetable *iopt, unsigned long iova,
 void iommufd_access_unpin_pages(struct iommufd_access *access,
 				unsigned long iova, unsigned long length)
 {
+	bool internal = iommufd_access_is_internal(access);
 	struct iopt_area_contig_iter iter;
 	struct io_pagetable *iopt;
 	unsigned long last_iova;
@@ -1208,7 +1436,8 @@ void iommufd_access_unpin_pages(struct iommufd_access *access,
 			area, iopt_area_iova_to_index(area, iter.cur_iova),
 			iopt_area_iova_to_index(
 				area,
-				min(last_iova, iopt_area_last_iova(area))));
+				min(last_iova, iopt_area_last_iova(area))),
+			internal);
 	WARN_ON(!iopt_area_contig_done(&iter));
 	up_read(&iopt->iova_rwsem);
 	mutex_unlock(&access->ioas_lock);
@@ -1257,6 +1486,7 @@ int iommufd_access_pin_pages(struct iommufd_access *access, unsigned long iova,
 			     unsigned long length, struct page **out_pages,
 			     unsigned int flags)
 {
+	bool internal = iommufd_access_is_internal(access);
 	struct iopt_area_contig_iter iter;
 	struct io_pagetable *iopt;
 	unsigned long last_iova;
@@ -1265,7 +1495,8 @@ int iommufd_access_pin_pages(struct iommufd_access *access, unsigned long iova,
 
 	/* Driver's ops don't support pin_pages */
 	if (IS_ENABLED(CONFIG_IOMMUFD_TEST) &&
-	    WARN_ON(access->iova_alignment != PAGE_SIZE || !access->ops->unmap))
+	    WARN_ON(access->iova_alignment != PAGE_SIZE ||
+		    (!internal && !access->ops->unmap)))
 		return -EINVAL;
 
 	if (!length)
@@ -1299,7 +1530,7 @@ int iommufd_access_pin_pages(struct iommufd_access *access, unsigned long iova,
 		}
 
 		rc = iopt_area_add_access(area, index, last_index, out_pages,
-					  flags);
+					  flags, internal);
 		if (rc)
 			goto err_remove;
 		out_pages += last_index - index + 1;
@@ -1322,7 +1553,8 @@ err_remove:
 				iopt_area_iova_to_index(area, iter.cur_iova),
 				iopt_area_iova_to_index(
 					area, min(last_iova,
-						  iopt_area_last_iova(area))));
+						  iopt_area_last_iova(area))),
+				internal);
 	}
 	up_read(&iopt->iova_rwsem);
 	mutex_unlock(&access->ioas_lock);
@@ -1349,7 +1581,7 @@ int iommufd_access_rw(struct iommufd_access *access, unsigned long iova,
 	struct io_pagetable *iopt;
 	struct iopt_area *area;
 	unsigned long last_iova;
-	int rc;
+	int rc = -EINVAL;
 
 	if (!length)
 		return -EINVAL;
@@ -1396,6 +1628,7 @@ EXPORT_SYMBOL_NS_GPL(iommufd_access_rw, "IOMMUFD");
 
 int iommufd_get_hw_info(struct iommufd_ucmd *ucmd)
 {
+	const u32 SUPPORTED_FLAGS = IOMMU_HW_INFO_FLAG_INPUT_TYPE;
 	struct iommu_hw_info *cmd = ucmd->cmd;
 	void __user *user_ptr = u64_to_user_ptr(cmd->data_uptr);
 	const struct iommu_ops *ops;
@@ -1405,12 +1638,23 @@ int iommufd_get_hw_info(struct iommufd_ucmd *ucmd)
 	void *data;
 	int rc;
 
-	if (cmd->flags || cmd->__reserved)
+	if (cmd->flags & ~SUPPORTED_FLAGS)
 		return -EOPNOTSUPP;
+	if (cmd->__reserved[0] || cmd->__reserved[1] || cmd->__reserved[2])
+		return -EOPNOTSUPP;
+
+	/* Clear the type field since drivers don't support a random input */
+	if (!(cmd->flags & IOMMU_HW_INFO_FLAG_INPUT_TYPE))
+		cmd->in_data_type = IOMMU_HW_INFO_TYPE_DEFAULT;
 
 	idev = iommufd_get_device(ucmd, cmd->dev_id);
 	if (IS_ERR(idev))
 		return PTR_ERR(idev);
+
+	if (iommufd_device_is_noiommu(idev)) {
+		rc = -EOPNOTSUPP;
+		goto out_put;
+	}
 
 	ops = dev_iommu_ops(idev->dev);
 	if (ops->hw_info) {
@@ -1426,7 +1670,7 @@ int iommufd_get_hw_info(struct iommufd_ucmd *ucmd)
 		 */
 		if (WARN_ON_ONCE(cmd->out_data_type ==
 				 IOMMU_HW_INFO_TYPE_NONE)) {
-			rc = -ENODEV;
+			rc = -EOPNOTSUPP;
 			goto out_free;
 		}
 	} else {
@@ -1461,6 +1705,40 @@ int iommufd_get_hw_info(struct iommufd_ucmd *ucmd)
 	cmd->out_capabilities = 0;
 	if (device_iommu_capable(idev->dev, IOMMU_CAP_DIRTY_TRACKING))
 		cmd->out_capabilities |= IOMMU_HW_CAP_DIRTY_TRACKING;
+
+	/* Report when ATS cannot be used for this device */
+	if (!device_iommu_capable(idev->dev, IOMMU_CAP_PCI_ATS_SUPPORTED))
+		cmd->out_capabilities |= IOMMU_HW_CAP_PCI_ATS_NOT_SUPPORTED;
+
+	cmd->out_max_pasid_log2 = 0;
+	/*
+	 * Currently, all iommu drivers enable PASID in the probe_device()
+	 * op if iommu and device supports it. So the max_pasids stored in
+	 * dev->iommu indicates both PASID support and enable status. A
+	 * non-zero dev->iommu->max_pasids means PASID is supported and
+	 * enabled. The iommufd only reports PASID capability to userspace
+	 * if it's enabled.
+	 */
+	if (idev->dev->iommu->max_pasids) {
+		cmd->out_max_pasid_log2 = ilog2(idev->dev->iommu->max_pasids);
+
+		if (dev_is_pci(idev->dev)) {
+			struct pci_dev *pdev = to_pci_dev(idev->dev);
+			int ctrl;
+
+			ctrl = pci_pasid_status(pdev);
+
+			WARN_ON_ONCE(ctrl < 0 ||
+				     !(ctrl & PCI_PASID_CTRL_ENABLE));
+
+			if (ctrl & PCI_PASID_CTRL_EXEC)
+				cmd->out_capabilities |=
+						IOMMU_HW_CAP_PCI_PASID_EXEC;
+			if (ctrl & PCI_PASID_CTRL_PRIV)
+				cmd->out_capabilities |=
+						IOMMU_HW_CAP_PCI_PASID_PRIV;
+		}
+	}
 
 	rc = iommufd_ucmd_respond(ucmd, sizeof(*cmd));
 out_free:

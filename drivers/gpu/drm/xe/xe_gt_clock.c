@@ -8,57 +8,56 @@
 #include "xe_gt_clock.h"
 
 #include "regs/xe_gt_regs.h"
-#include "regs/xe_regs.h"
-#include "xe_assert.h"
-#include "xe_device.h"
-#include "xe_gt.h"
+#include "xe_gt_types.h"
 #include "xe_gt_printk.h"
-#include "xe_macros.h"
 #include "xe_mmio.h"
 
-static u32 get_crystal_clock_freq(u32 rpm_config_reg)
+#define f19_2_mhz	19200000
+#define f24_mhz		24000000
+#define f25_mhz		25000000
+#define f38_4_mhz	38400000
+#define ts_base_83	83333
+#define ts_base_52	52083
+#define ts_base_80	80000
+
+static void read_crystal_clock(struct xe_gt *gt, u32 rpm_config_reg, u32 *freq,
+			       u32 *timestamp_base)
 {
-	const u32 f19_2_mhz = 19200000;
-	const u32 f24_mhz = 24000000;
-	const u32 f25_mhz = 25000000;
-	const u32 f38_4_mhz = 38400000;
 	u32 crystal_clock = REG_FIELD_GET(RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_MASK,
 					  rpm_config_reg);
 
 	switch (crystal_clock) {
 	case RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_24_MHZ:
-		return f24_mhz;
+		*freq = f24_mhz;
+		*timestamp_base = ts_base_83;
+		return;
 	case RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_19_2_MHZ:
-		return f19_2_mhz;
+		*freq = f19_2_mhz;
+		*timestamp_base = ts_base_52;
+		return;
 	case RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_38_4_MHZ:
-		return f38_4_mhz;
+		*freq = f38_4_mhz;
+		*timestamp_base = ts_base_52;
+		return;
 	case RPM_CONFIG0_CRYSTAL_CLOCK_FREQ_25_MHZ:
-		return f25_mhz;
+		*freq = f25_mhz;
+		*timestamp_base = ts_base_80;
+		return;
 	default:
-		XE_WARN_ON("NOT_POSSIBLE");
-		return 0;
+		xe_gt_warn(gt, "Invalid crystal clock frequency: %u", crystal_clock);
+		*freq = 0;
+		*timestamp_base = 0;
+		return;
 	}
 }
 
 int xe_gt_clock_init(struct xe_gt *gt)
 {
-	u32 c0 = xe_mmio_read32(&gt->mmio, RPM_CONFIG0);
-	u32 freq = 0;
+	u32 freq;
+	u32 c0;
 
-	/*
-	 * CTC_MODE[0] = 1 is definitely not supported for Xe2 and later
-	 * platforms.  In theory it could be a valid setting for pre-Xe2
-	 * platforms, but there's no documentation on how to properly handle
-	 * this case.  Reading TIMESTAMP_OVERRIDE, as the driver attempted in
-	 * the past has been confirmed as incorrect by the hardware architects.
-	 *
-	 * For now just warn if we ever encounter hardware in the wild that
-	 * has this setting and move on as if it hadn't been set.
-	 */
-	if (xe_mmio_read32(&gt->mmio, CTC_MODE) & CTC_SOURCE_DIVIDE_LOGIC)
-		xe_gt_warn(gt, "CTC_MODE[0] is set; this is unexpected and undocumented\n");
-
-	freq = get_crystal_clock_freq(c0);
+	c0 = xe_mmio_read32(&gt->mmio, RPM_CONFIG0);
+	read_crystal_clock(gt, c0, &freq, &gt->info.timestamp_base);
 
 	/*
 	 * Now figure out how the command stream's timestamp
@@ -71,11 +70,6 @@ int xe_gt_clock_init(struct xe_gt *gt)
 	return 0;
 }
 
-static u64 div_u64_roundup(u64 n, u32 d)
-{
-	return div_u64(n + d - 1, d);
-}
-
 /**
  * xe_gt_clock_interval_to_ms - Convert sampled GT clock ticks to msec
  *
@@ -86,5 +80,5 @@ static u64 div_u64_roundup(u64 n, u32 d)
  */
 u64 xe_gt_clock_interval_to_ms(struct xe_gt *gt, u64 count)
 {
-	return div_u64_roundup(count * MSEC_PER_SEC, gt->info.reference_clock);
+	return mul_u64_u32_div(count, MSEC_PER_SEC, gt->info.reference_clock);
 }

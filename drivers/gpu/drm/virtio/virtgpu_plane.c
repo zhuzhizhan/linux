@@ -24,12 +24,14 @@
  */
 
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <linux/virtio_dma_buf.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_panic.h>
+#include <drm/drm_print.h>
 
 #include "virtgpu_drv.h"
 
@@ -78,7 +80,7 @@ drm_plane_state *virtio_gpu_plane_duplicate_state(struct drm_plane *plane)
 	if (WARN_ON(!plane->state))
 		return NULL;
 
-	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	new = kzalloc_obj(*new);
 	if (!new)
 		return NULL;
 
@@ -96,7 +98,7 @@ static const struct drm_plane_funcs virtio_gpu_plane_funcs = {
 };
 
 static int virtio_gpu_plane_atomic_check(struct drm_plane *plane,
-					 struct drm_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state,
 										 plane);
@@ -120,7 +122,7 @@ static int virtio_gpu_plane_atomic_check(struct drm_plane *plane,
 	crtc_state = drm_atomic_get_crtc_state(state,
 					       new_plane_state->crtc);
 	if (IS_ERR(crtc_state))
-                return PTR_ERR(crtc_state);
+		return PTR_ERR(crtc_state);
 
 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
 						  DRM_PLANE_NO_SCALING,
@@ -214,7 +216,10 @@ static void virtio_gpu_resource_flush(struct drm_plane *plane,
 		if (!objs)
 			return;
 		virtio_gpu_array_add_obj(objs, vgfb->base.obj[0]);
-		virtio_gpu_array_lock_resv(objs);
+		if (virtio_gpu_lock_one_resv_uninterruptible(objs)) {
+			virtio_gpu_array_put_free(objs);
+			return;
+		}
 		virtio_gpu_cmd_resource_flush(vgdev, bo->hw_res_handle, x, y,
 					      width, height, objs,
 					      vgplane_st->fence);
@@ -229,7 +234,7 @@ static void virtio_gpu_resource_flush(struct drm_plane *plane,
 }
 
 static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
-					    struct drm_atomic_state *state)
+					    struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
 									   plane);
@@ -366,13 +371,7 @@ static int virtio_gpu_plane_prepare_fb(struct drm_plane *plane,
 		return 0;
 
 	obj = new_state->fb->obj[0];
-	if (obj->import_attach) {
-		ret = virtio_gpu_prepare_imported_obj(plane, new_state, obj);
-		if (ret)
-			return ret;
-	}
-
-	if (bo->dumb || obj->import_attach) {
+	if (bo->dumb || drm_gem_is_imported(obj)) {
 		vgplane_st->fence = virtio_gpu_fence_alloc(vgdev,
 						     vgdev->fence_drv.context,
 						     0);
@@ -380,7 +379,21 @@ static int virtio_gpu_plane_prepare_fb(struct drm_plane *plane,
 			return -ENOMEM;
 	}
 
+	if (drm_gem_is_imported(obj)) {
+		ret = virtio_gpu_prepare_imported_obj(plane, new_state, obj);
+		if (ret)
+			goto err_fence;
+	}
+
 	return 0;
+
+err_fence:
+	if (vgplane_st->fence) {
+		dma_fence_put(&vgplane_st->fence->f);
+		vgplane_st->fence = NULL;
+	}
+
+	return ret;
 }
 
 static void virtio_gpu_cleanup_imported_obj(struct drm_gem_object *obj)
@@ -409,12 +422,12 @@ static void virtio_gpu_plane_cleanup_fb(struct drm_plane *plane,
 	}
 
 	obj = state->fb->obj[0];
-	if (obj->import_attach)
+	if (drm_gem_is_imported(obj))
 		virtio_gpu_cleanup_imported_obj(obj);
 }
 
 static void virtio_gpu_cursor_plane_update(struct drm_plane *plane,
-					   struct drm_atomic_state *state)
+					   struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
 									   plane);
@@ -450,7 +463,10 @@ static void virtio_gpu_cursor_plane_update(struct drm_plane *plane,
 		if (!objs)
 			return;
 		virtio_gpu_array_add_obj(objs, vgfb->base.obj[0]);
-		virtio_gpu_array_lock_resv(objs);
+		if (virtio_gpu_lock_one_resv_uninterruptible(objs)) {
+			virtio_gpu_array_put_free(objs);
+			return;
+		}
 		virtio_gpu_cmd_transfer_to_host_2d
 			(vgdev, 0,
 			 plane->state->crtc_w,
@@ -500,11 +516,19 @@ static int virtio_drm_get_scanout_buffer(struct drm_plane *plane,
 
 	bo = gem_to_virtio_gpu_obj(plane->state->fb->obj[0]);
 
-	/* Only support mapped shmem bo */
-	if (virtio_gpu_is_vram(bo) || bo->base.base.import_attach || !bo->base.vaddr)
+	if (virtio_gpu_is_vram(bo) || drm_gem_is_imported(&bo->base.base))
 		return -ENODEV;
 
-	iosys_map_set_vaddr(&sb->map[0], bo->base.vaddr);
+	if (bo->base.vaddr) {
+		iosys_map_set_vaddr(&sb->map[0], bo->base.vaddr);
+	} else {
+		struct drm_gem_shmem_object *shmem = &bo->base;
+
+		if (!shmem->pages)
+			return -ENODEV;
+		/* map scanout buffer later */
+		sb->pages = shmem->pages;
+	}
 
 	sb->format = plane->state->fb->format;
 	sb->height = plane->state->fb->height;
@@ -565,6 +589,7 @@ struct drm_plane *virtio_gpu_plane_init(struct virtio_gpu_device *vgdev,
 	struct drm_plane *plane;
 	const uint32_t *formats;
 	int nformats;
+	int ret;
 
 	if (type == DRM_PLANE_TYPE_CURSOR) {
 		formats = virtio_gpu_cursor_formats;
@@ -586,6 +611,21 @@ struct drm_plane *virtio_gpu_plane_init(struct virtio_gpu_device *vgdev,
 
 	if (type == DRM_PLANE_TYPE_PRIMARY)
 		drm_plane_enable_fb_damage_clips(plane);
+	else if (type == DRM_PLANE_TYPE_CURSOR)
+		drm_plane_create_blend_mode_property(plane,
+						     BIT(DRM_MODE_BLEND_PREMULTI));
+
+	if (type == DRM_PLANE_TYPE_CURSOR) {
+		/*
+		 * The cursor plane exposes a format with an alpha channel,
+		 * which requires a blend mode property. The host blends
+		 * premultiplied alpha, matching the property's default.
+		 */
+		ret = drm_plane_create_blend_mode_property(plane,
+							   BIT(DRM_MODE_BLEND_PREMULTI));
+		if (ret)
+			return ERR_PTR(ret);
+	}
 
 	return plane;
 }

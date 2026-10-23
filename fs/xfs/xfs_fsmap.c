@@ -3,7 +3,7 @@
  * Copyright (C) 2017 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <darrick.wong@oracle.com>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -876,6 +876,7 @@ xfs_getfsmap_rtdev_rmapbt(
 	const struct xfs_fsmap		*keys,
 	struct xfs_getfsmap_info	*info)
 {
+	struct xfs_fsmap		key0 = *keys; /* struct copy */
 	struct xfs_mount		*mp = tp->t_mountp;
 	struct xfs_rtgroup		*rtg = NULL;
 	struct xfs_btree_cur		*bt_cur = NULL;
@@ -887,32 +888,46 @@ xfs_getfsmap_rtdev_rmapbt(
 	int				error = 0;
 
 	eofs = XFS_FSB_TO_BB(mp, mp->m_sb.sb_rtstart + mp->m_sb.sb_rblocks);
-	if (keys[0].fmr_physical >= eofs)
+	if (key0.fmr_physical >= eofs)
 		return 0;
 
+	/*
+	 * On zoned filesystems with an internal rt volume, the volume comes
+	 * immediately after the end of the data volume.  However, the
+	 * xfs_rtblock_t address space is relative to the start of the data
+	 * device, which means that the first @rtstart fsblocks do not actually
+	 * point anywhere.  If a fsmap query comes in with the low key starting
+	 * below @rtstart, report it as "owned by filesystem".
+	 */
 	rtstart_daddr = XFS_FSB_TO_BB(mp, mp->m_sb.sb_rtstart);
-	if (keys[0].fmr_physical < rtstart_daddr) {
+	if (xfs_has_zoned(mp) && key0.fmr_physical < rtstart_daddr) {
 		struct xfs_fsmap_irec		frec = {
 			.owner			= XFS_RMAP_OWN_FS,
 			.len_daddr		= rtstart_daddr,
 		};
 
-		/* Adjust the low key if we are continuing from where we left off. */
-		if (keys[0].fmr_length > 0) {
-			info->low_daddr = keys[0].fmr_physical + keys[0].fmr_length;
-			return 0;
+		/*
+		 * Adjust the start of the query range if we're picking up from
+		 * a previous round, and only emit the record if we haven't
+		 * already gone past.
+		 */
+		key0.fmr_physical += key0.fmr_length;
+		if (key0.fmr_physical < rtstart_daddr) {
+			error = xfs_getfsmap_helper(tp, info, &frec);
+			if (error)
+				return error;
+
+			key0.fmr_physical = rtstart_daddr;
 		}
 
-		/* Fabricate an rmap entry for space occupied by the data dev */
-		error = xfs_getfsmap_helper(tp, info, &frec);
-		if (error)
-			return error;
+		/* Zero the other fields to avoid further adjustments. */
+		key0.fmr_owner = 0;
+		key0.fmr_offset = 0;
+		key0.fmr_length = 0;
 	}
 
-	start_rtb = xfs_daddr_to_rtb(mp, rtstart_daddr + keys[0].fmr_physical);
-	end_rtb = xfs_daddr_to_rtb(mp, rtstart_daddr +
-			min(eofs - 1, keys[1].fmr_physical));
-
+	start_rtb = xfs_daddr_to_rtb(mp, key0.fmr_physical);
+	end_rtb = xfs_daddr_to_rtb(mp, min(eofs - 1, keys[1].fmr_physical));
 	info->missing_owner = XFS_FMR_OWN_FREE;
 
 	/*
@@ -920,12 +935,12 @@ xfs_getfsmap_rtdev_rmapbt(
 	 * low to the fsmap low key and max out the high key to the end
 	 * of the rtgroup.
 	 */
-	info->low.rm_offset = XFS_BB_TO_FSBT(mp, keys[0].fmr_offset);
-	error = xfs_fsmap_owner_to_rmap(&info->low, &keys[0]);
+	info->low.rm_offset = XFS_BB_TO_FSBT(mp, key0.fmr_offset);
+	error = xfs_fsmap_owner_to_rmap(&info->low, &key0);
 	if (error)
 		return error;
-	info->low.rm_blockcount = XFS_BB_TO_FSBT(mp, keys[0].fmr_length);
-	xfs_getfsmap_set_irec_flags(&info->low, &keys[0]);
+	info->low.rm_blockcount = XFS_BB_TO_FSBT(mp, key0.fmr_length);
+	xfs_getfsmap_set_irec_flags(&info->low, &key0);
 
 	/* Adjust the low key if we are continuing from where we left off. */
 	if (info->low.rm_blockcount == 0) {
@@ -1159,8 +1174,7 @@ xfs_getfsmap(
 	if (!xfs_getfsmap_check_keys(&head->fmh_keys[0], &head->fmh_keys[1]))
 		return -EINVAL;
 
-	use_rmap = xfs_has_rmapbt(mp) &&
-		   has_capability_noaudit(current, CAP_SYS_ADMIN);
+	use_rmap = xfs_has_rmapbt(mp) && capable_noaudit(CAP_SYS_ADMIN);
 	head->fmh_entries = 0;
 
 	/* Set up our device handlers. */
@@ -1255,9 +1269,7 @@ xfs_getfsmap(
 		 * buffer locking abilities to detect cycles in the rmapbt
 		 * without deadlocking.
 		 */
-		error = xfs_trans_alloc_empty(mp, &tp);
-		if (error)
-			break;
+		tp = xfs_trans_alloc_empty(mp);
 
 		info.dev = handlers[i].dev;
 		info.last = false;
@@ -1313,11 +1325,11 @@ xfs_ioc_getfsmap(
 	 */
 	count = min_t(unsigned int, head.fmh_count,
 			131072 / sizeof(struct fsmap));
-	recs = kvcalloc(count, sizeof(struct fsmap), GFP_KERNEL);
+	recs = kvzalloc_objs(struct fsmap, count);
 	if (!recs) {
 		count = min_t(unsigned int, head.fmh_count,
 				PAGE_SIZE / sizeof(struct fsmap));
-		recs = kvcalloc(count, sizeof(struct fsmap), GFP_KERNEL);
+		recs = kvzalloc_objs(struct fsmap, count);
 		if (!recs)
 			return -ENOMEM;
 	}
